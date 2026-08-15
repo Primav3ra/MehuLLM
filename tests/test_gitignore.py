@@ -85,10 +85,37 @@ def test_source_paths_are_not_ignored(path):
     assert not _ignored(path), f"{path!r} is ignored but must be committed."
 
 
-def test_gitkeep_survives_the_directory_exclusion():
-    """The negation must actually work -- that is the whole reason for /* form."""
-    assert not _ignored("data/raw/.gitkeep")
-    assert not _ignored("data/derived/.gitkeep")
+def test_data_dirs_have_no_negation_hole():
+    """`data/` is excluded WHOLESALE, with no .gitkeep exception.
+
+    A `!data/raw/.gitkeep` exception forces git to descend into an excluded
+    directory; a trailing-slash pattern then does not match the files inside,
+    which is precisely how the WhatsApp exports became addable. Assert the
+    exception has not crept back in.
+    """
+    # Strip comments first -- the explanatory comment above literally contains
+    # `!data/raw/.gitkeep`, and matching that would fail the test on prose.
+    patterns = [
+        ln.strip()
+        for ln in (REPO / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    holes = [p for p in patterns if p.startswith(("!data/", "!.secrets/"))]
+    assert not holes, f"negation inside an excluded data dir re-opens the leak: {holes}"
+    for p in ("data/raw/.gitkeep", "data/derived/.gitkeep", ".secrets/.gitkeep"):
+        assert _ignored(p), f"{p} must be ignored -- no placeholder should be tracked"
+
+
+def test_runtime_creates_the_data_dirs():
+    """Nothing holds the directories' place in git, so code must make them."""
+    import inspect
+
+    from mehullm.pipeline import build_sft, neutralize
+
+    assert "mkdir(parents=True, exist_ok=True)" in inspect.getsource(build_sft.build)
+    assert "mkdir(parents=True, exist_ok=True)" in inspect.getsource(
+        neutralize.DraftCache.__init__
+    )
 
 
 def test_no_sensitive_file_is_currently_tracked():

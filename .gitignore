@@ -1,40 +1,55 @@
-# ─────────────────────────────────────────────────────────────
-# PRIVACY-CRITICAL — never commit personal data.
-# This block exists before any data lands in the repo, by design.
-# ─────────────────────────────────────────────────────────────
-data/raw/                 # WhatsApp exports — raw, unscrubbed
-data/derived/             # SFT pairs, name_map.json, neutralized drafts
-data/*.db
-data/*.sqlite*
+# Raw WhatsApp exports and everything derived from them. Never commit.
+#
+# The whole directory is excluded, with NO .gitkeep negation. That is
+# deliberate: a `!data/raw/.gitkeep` exception forces git to descend into an
+# excluded directory, and a trailing-slash pattern then fails to match the
+# FILES inside it -- which is exactly how every WhatsApp export ended up
+# untracked-but-addable earlier. No exception means no hole.
+#
+# The directories are created at runtime by the pipeline (mkdir parents=True),
+# so nothing needs to hold their place in git.
+data/
+.secrets/
+
+# Belt-and-braces: even if the paths above change, these never get committed.
 *.jsonl
+!tests/fixtures/*.jsonl
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 name_map.json
 contacts.json
-!data/raw/.gitkeep
-!data/derived/.gitkeep
-!tests/fixtures/*.jsonl   # synthetic fixtures ARE safe to commit
+audit_sample*.txt
+census.json
+pairs*.jsonl
+sft_pairs*.jsonl
 
-# Secrets
+# ───────────────────────── Secrets ─────────────────────────
 .env
 .env.*
 !.env.example
 *.pem
 *.key
 credentials.json
-token.json
+*token.json
+client_secret*.json
 gcp-oauth*.json
+service-account*.json
 
-# Models / weights
+# ──────────────────── Models / weights ────────────────────
 *.gguf
 *.safetensors
 *.bin
 *.pth
+*.ckpt
 models/
 outputs/
 merged_fp16/
+checkpoints/
 
-# ─────────────────────────────────────────────────────────────
-# Python
-# ─────────────────────────────────────────────────────────────
+# ───────────────────────── Python ─────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -47,18 +62,14 @@ venv/
 htmlcov/
 .coverage
 
-# ─────────────────────────────────────────────────────────────
-# Node / Next.js
-# ─────────────────────────────────────────────────────────────
+# ─────────────────── Node / Next.js ───────────────────────
 node_modules/
 .next/
 out/
 .vercel/
 *.tsbuildinfo
 
-# ─────────────────────────────────────────────────────────────
-# Editors / OS
-# ─────────────────────────────────────────────────────────────
+# ─────────────────── Editors / OS ─────────────────────────
 .vscode/
 .idea/
 .qodo/
@@ -66,5 +77,5 @@ Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
 
-# Stray planning artifacts (the canonical copy lives in docs/)
+# Stray planning artifacts (canonical copy lives in docs/PLAN.md)
 we-will-be-building-*.md
