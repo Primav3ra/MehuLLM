@@ -1,0 +1,8 @@
+# Normalise line endings so the repo stays clean across Windows/Colab/Linux.
+* text=auto eol=lf
+
+# WhatsApp exports and fixtures are data — never let git rewrite their bytes.
+# Line-ending or encoding munging here would corrupt the corpus silently.
+*.txt   -text
+*.jsonl -text
+*.gguf  binary

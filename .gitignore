@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────
+# PRIVACY-CRITICAL — never commit personal data.
+# This block exists before any data lands in the repo, by design.
+# ─────────────────────────────────────────────────────────────
+data/raw/                 # WhatsApp exports — raw, unscrubbed
+data/derived/             # SFT pairs, name_map.json, neutralized drafts
+data/*.db
+data/*.sqlite*
+*.jsonl
+name_map.json
+contacts.json
+!data/raw/.gitkeep
+!data/derived/.gitkeep
+!tests/fixtures/*.jsonl   # synthetic fixtures ARE safe to commit
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+gcp-oauth*.json
+
+# Models / weights
+*.gguf
+*.safetensors
+*.bin
+*.pth
+models/
+outputs/
+merged_fp16/
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+htmlcov/
+.coverage
+
+# ─────────────────────────────────────────────────────────────
+# Node / Next.js
+# ─────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+
+# ─────────────────────────────────────────────────────────────
+# Editors / OS
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.qodo/
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Stray planning artifacts (the canonical copy lives in docs/)
+we-will-be-building-*.md
