@@ -88,7 +88,7 @@ class OllamaClient:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "think": False if no_think else True,
+            "think": not no_think,
             "options": {
                 "temperature": temperature,
                 "num_predict": num_predict,
@@ -134,7 +134,7 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "think": False if no_think else True,
+            "think": not no_think,
             "options": {
                 "temperature": temperature,
                 "num_predict": num_predict,

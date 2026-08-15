@@ -219,9 +219,7 @@ def _is_degenerate(draft: str, target: str) -> bool:
     if d == t:
         return True
     # Near-copy: only casing/punctuation changed, or a token or two differs.
-    if len(t) > 12 and (d in t or t in d):
-        return True
-    return False
+    return bool(len(t) > 12 and (d in t or t in d))
 
 
 def _plausible(draft: str, target: str) -> bool:
@@ -260,7 +258,7 @@ def _stratified_sample(
         by_bucket[r["bucket"]].append(r)
 
     out: list[dict] = []
-    for bucket, items in by_bucket.items():
+    for _bucket, items in by_bucket.items():
         share = len(items) / len(records)
         want = max(1, round(limit * share))
         by_chat: dict[str, list[dict]] = defaultdict(list)
