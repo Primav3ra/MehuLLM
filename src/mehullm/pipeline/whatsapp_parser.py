@@ -1,26 +1,12 @@
 """Parse WhatsApp `Export chat` text files into structured messages.
 
-Two-stage by design, not one mega-regex:
+HEADER_RE decides "new message?" (a line failing it is a continuation of the
+previous one); BODY_RE splits sender from text (a line failing it is a system
+event).
 
-    stage 1  HEADER_RE  -- "does this line start a new message?"
-                           A line that fails this is a CONTINUATION of the
-                           previous message (multi-line messages are common).
-    stage 2  BODY_RE    -- "split sender from text"
-                           A line that fails this is a SYSTEM event
-                           (joins/leaves/encryption notices/etc).
-
-STYLE PRESERVATION IS A HARD REQUIREMENT.
-The whole point of this corpus is to capture how one specific person writes:
-Hinglish, Gen-Z slang, lowercase, "yaaar", emoji, missing punctuation. So this
-parser normalises as little as humanly possible:
-
-  * NFC only -- never NFKC/NFKD, which decompose Devanagari matras and mangle
-    ZWJ conjuncts (क्ष -> क + ् + ष renders wrong and tokenises worse).
-  * Invisible WhatsApp control marks (LRM/RLM/PDF/BOM) are stripped, because
-    they are injected by the exporter and are not authored content.
-  * NBSP variants are folded to a plain space so the regexes match reliably.
-  * Nothing else. No case folding, no punctuation stripping, no emoji removal,
-    no whitespace collapsing inside a message.
+Normalises as little as possible -- the corpus exists to capture how one person
+writes. NFC only, never NFKC/NFKD (which decompose Devanagari matras). ZWJ/ZWNJ
+are kept: load-bearing in conjuncts and emoji.
 """
 
 from __future__ import annotations
@@ -35,9 +21,7 @@ import regex
 
 __all__ = ["Message", "Chat", "parse_export", "parse_text"]
 
-# --------------------------------------------------------------------------
 # Character-level normalisation
-# --------------------------------------------------------------------------
 
 # Control marks WhatsApp injects into exports. These are exporter artifacts,
 # not authored content, and they silently break naive regexes.
@@ -71,9 +55,7 @@ def normalize_line(line: str) -> str:
     return unicodedata.normalize("NFC", line.translate(_INVISIBLE).translate(_NBSP))
 
 
-# --------------------------------------------------------------------------
 # Stage 1: message header
-# --------------------------------------------------------------------------
 
 HEADER_RE = regex.compile(
     r"""
@@ -90,9 +72,7 @@ HEADER_RE = regex.compile(
     regex.VERBOSE | regex.DOTALL,
 )
 
-# --------------------------------------------------------------------------
 # Stage 2: sender / text
-# --------------------------------------------------------------------------
 # '~' prefixes a non-contact participant's push name in group exports.
 # Sender is non-greedy and colon-free so "me: check this: link" splits at the
 # FIRST colon, giving sender="me", text="check this: link".
@@ -101,27 +81,16 @@ BODY_RE = regex.compile(
     regex.DOTALL,
 )
 
-# --------------------------------------------------------------------------
-# Classification patterns
-# --------------------------------------------------------------------------
-# Checked BEFORE BODY_RE, because several system notices contain a colon and
-# would otherwise be mis-split into a bogus sender:
-#   "Mehul changed the subject to: Trip Planning"  ->  sender="...subject to"
-# PERFORMANCE NOTE, and it is load-bearing on a real 25 MB corpus:
-# every alternation is ANCHORED and the actor prefix is BOUNDED. An earlier
-# version used `.*\ added\b`-style branches, which backtrack quadratically per
-# line and made a full census run take minutes instead of seconds.
+# Checked BEFORE BODY_RE: system notices containing a colon would otherwise be
+# mis-split into a bogus sender.
 #
-# The `[^:\n]` class is doing double duty. It caps backtracking, AND it makes
-# the colon a hard barrier -- so a real message like
-#     "Mehul: I left home early"
-# can never reach the `left` verb, because matching it would require crossing
-# the ": " that separates sender from body. System notices have no such colon
-# before their verb. Faster and more correct at the same time.
+# Every alternation is anchored and the actor prefix bounded by `[^:\n]{0,60}`.
+# Unbounded `.*\ added\b` branches backtracked quadratically -- minutes instead
+# of seconds on 25 MB. The colon-free class also stops "Mehul: I left home"
+# reaching the `left` verb, so it is faster and more correct at once.
 _SYSTEM_RE = regex.compile(
     r"""
     ^(?:
-      # --- notices that start with a literal ---
       Messages\ and\ calls\ are\ end-to-end\ encrypted
     | Your\ security\ code\ with\
     | Live\ location\ shared
@@ -130,7 +99,6 @@ _SYSTEM_RE = regex.compile(
     | Disappearing\ messages\
     | You're\ now\ an\ admin
     | Tap\ to\ (?:learn\ more|change)
-      # --- actor-prefixed notices (bounded, colon-barriered) ---
     | [^:\n]{0,60}?\ (?:
           changed\ (?:the\ subject|their\ phone\ number|to\ |the\ group)
         | created\ (?:group|this\ group)
@@ -187,9 +155,7 @@ _CALL_NOTICE_RE = regex.compile(
 _DEVANAGARI_RE = regex.compile(r"\p{Devanagari}")
 
 
-# --------------------------------------------------------------------------
 # Data model
-# --------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -231,9 +197,7 @@ class Chat:
         return [m for m in self.messages if m.is_content]
 
 
-# --------------------------------------------------------------------------
 # Date-order resolution -- decided ONCE PER FILE, never per line
-# --------------------------------------------------------------------------
 
 
 def _resolve_date_order(pairs: list[tuple[int, int, int]]) -> tuple[str, str]:
@@ -293,15 +257,12 @@ def _full_year(y: int) -> int:
     return y if y >= 1000 else 2000 + y
 
 
-# --------------------------------------------------------------------------
 # Parsing
-# --------------------------------------------------------------------------
 
 
 def parse_text(raw: str, chat_id: str = "chat", path: Path | None = None) -> Chat:
     lines = raw.splitlines()
 
-    # --- pass 1: collect date fields so we can resolve the order up front ---
     date_fields: list[tuple[int, int, int]] = []
     for line in lines:
         m = HEADER_RE.match(normalize_line(line))
@@ -316,7 +277,6 @@ def parse_text(raw: str, chat_id: str = "chat", path: Path | None = None) -> Cha
         date_order_evidence=evidence,
     )
 
-    # --- pass 2: build messages ---
     current: Message | None = None
     for i, raw_line in enumerate(lines, start=1):
         line = normalize_line(raw_line).rstrip()

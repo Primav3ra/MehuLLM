@@ -6,22 +6,13 @@ this module is the one-way scrubber used by the data pipeline and the trace
 writer, which share these patterns deliberately: one implementation, tested
 once, so the two can never drift apart.
 
-WHAT THIS MUST NOT DO
----------------------
-This corpus exists to capture how one person writes. Every pattern below is
-therefore anchored tightly enough that it cannot eat authored style:
+Every pattern is anchored tightly enough that it cannot eat authored style:
+"100%", "2moro", "gn8", "yaaar", emoji and casing are untouched. Bare 6-digit
+numbers are NOT treated as OTPs without a nearby context word -- "got 250109
+views" is style data.
 
-  * "100%", "2moro", "gn8", "4u", "on god fr fr"  -- untouched
-  * "yaaar", "acha", "bhaiii"                     -- untouched
-  * emoji, casing, punctuation, elongation        -- untouched
-
-The dangerous patterns are the loose numeric ones. A bare 6-digit number is NOT
-treated as an OTP or a PIN code -- both require nearby context words -- because
-"got 250109 views" is style data and "<OTP>" is not.
-
-Names are pseudonymised CONSISTENTLY (Rohan -> Person_A everywhere), never
-flattened to a single token: collapsing every name to "<NAME>" destroys the
-conversational structure the model needs to learn turn-taking.
+Names are pseudonymised CONSISTENTLY (Rohan -> Person_A), never flattened to
+"<NAME>", which would destroy the turn-taking structure.
 """
 
 from __future__ import annotations
@@ -42,7 +33,6 @@ __all__ = ["scrub", "scrub_with_stats", "NameMap", "PATTERNS"]
 _D = r"[0-9०-९]"
 
 PATTERNS: dict[str, regex.Pattern] = {
-    # --- highest specificity first; order matters, see _ORDER below ---
     "EMAIL": regex.compile(r"\b[\w.\-+]+@[\w\-]+\.[\w.\-]{2,}\b"),
     "URL": regex.compile(r"https?://\S+|\bwww\.[\w\-]+\.\w{2,}\S*"),
     # UPI handles: mehul@okicici, 9876543210@ybl
@@ -153,9 +143,7 @@ def scrub_with_stats(text: str) -> tuple[str, Counter[str]]:
     return text, found
 
 
-# --------------------------------------------------------------------------
 # Consistent name pseudonymisation
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -202,7 +190,6 @@ class NameMap:
             text = pattern.sub(self.alias_for(name), text)
         return text
 
-    # -- persistence (gitignored; regenerable but stable once written) --
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(

@@ -4,21 +4,15 @@ The voice model is a rewriter: (neutral draft + context) -> Mehul's reply. Chat
 logs give us the output side for free, but not the input. This module
 synthesises it with a local model.
 
-RUNS LOCALLY, AND THAT IS A REQUIREMENT, NOT A PREFERENCE.
-Generating these drafts with a hosted API would ship raw 1:1 chat content to a
-third party and break the project's stated privacy invariant. Gemini's free
-tier in particular trains on submitted data. So this uses Ollama on the box.
+Runs locally by requirement: a hosted API would ship raw 1:1 chats to a third
+party, and Gemini's free tier trains on submitted data.
 
-TWO VARIANTS, AND THE MIX MATTERS
----------------------------------
-A (60%) -- neutral paraphrase of the reply.
-    Teaches CONTENT FIDELITY: the model learns to carry every fact across.
-B (40%) -- the same content re-expressed as a verbose AI assistant would say it.
-    Teaches COMPRESSION + STYLE TRANSFER, and matches the real inference-time
-    input distribution, since at runtime the draft comes from exactly such a model.
-
-Without B the model learns only to undo a paraphraser's tics. Without A it
-learns to drop facts.
+Two variants, and the mix matters:
+  A (60%) neutral paraphrase       -> teaches content fidelity
+  B (40%) verbose assistant draft  -> teaches compression + style transfer, and
+          matches the real inference-time input distribution
+Without B the model only learns to undo a paraphraser's tics; without A it drops
+facts.
 
 Note this deviates from the original plan, which had B answer the context
 freely. That would produce drafts whose CONTENT differs from the real reply,
@@ -143,9 +137,7 @@ class NeutralizeStats:
     elapsed_s: float = 0.0
 
 
-# --------------------------------------------------------------------------
 # Draft cache -- content-addressed, so re-runs and crashes are free
-# --------------------------------------------------------------------------
 
 
 class DraftCache:
@@ -190,9 +182,6 @@ class DraftCache:
 
     def count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM drafts").fetchone()[0]
-
-
-# --------------------------------------------------------------------------
 
 
 def _render_context(context: list[dict[str, str]], max_turns: int = 4) -> str:

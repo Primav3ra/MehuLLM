@@ -16,18 +16,13 @@ local model over these pairs. Keeping the two steps separate means the slow,
 overnight generation step can be re-run without re-deriving the corpus, and the
 expensive step is cached by content hash.
 
-THE TWO DECISIONS MOST LIKELY TO RUIN THE FINE-TUNE
----------------------------------------------------
-1. **Short replies.** "ok", "hmm", "haan" are ~35% of a raw WhatsApp corpus.
-   Delete them and the model writes essays; keep them all and it collapses into
-   a one-word machine. So they are DOWNSAMPLED, never dropped -- they are the
-   style. The caps below are the whole reason this file has statistics in it.
+Two decisions that would otherwise ruin the fine-tune:
 
-2. **Splitting by message.** Two turns from the same conversation, one in train
-   and one in val, leak: the model has effectively seen the val example's
-   context. The split is therefore BY CHAT FILE, and two whole chats are held
-   out untouched so style scoring is measured against a person the model never
-   trained on.
+1. Short replies ("ok", "hmm", "haan") are ~35% of the corpus. Dropped, the
+   model writes essays; kept whole, it collapses to one word. So: downsampled.
+2. Split BY CHAT FILE, never by message -- two turns from one conversation
+   split across train/val leak context. Two chats are held out untouched for
+   style scoring.
 """
 
 from __future__ import annotations
@@ -115,9 +110,6 @@ class Record:
             },
             ensure_ascii=False,
         )
-
-
-# --------------------------------------------------------------------------
 
 
 def _scrub_pair(pair: Pair, names: NameMap, all_names: list[str], stats: BuildStats):
@@ -248,9 +240,6 @@ def _assign_splits(
         r.split = "heldout" if r.chat_id in heldout else "val" if r.chat_id in val else "train"
         stats.per_split[r.split] += 1
     stats.heldout_chats = sorted(heldout)
-
-
-# --------------------------------------------------------------------------
 
 
 def build(
