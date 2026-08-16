@@ -1,0 +1,72 @@
+# Guardrail policy.
+#
+# FAIL CLOSED: default_action is `confirm`, so a newly added server's tools
+# prompt rather than fire. A denylist would silently auto-allow them.
+
+default_action: confirm
+
+limits:
+  max_tool_calls_per_turn: 25
+  max_turn_seconds: 180
+  max_daily_requests: 200   # free-tier quota guard, NOT a dollar cap
+  max_steps: 12
+
+# Tier assignment by glob. First match wins.
+#   T0 read-only            -> allow
+#   T1 reversible write     -> allow, traced
+#   T2 irreversible/outbound-> confirm ALWAYS
+#   T3 never                -> deny
+tiers:
+  # --- T0: read-only ---
+  "search__*": T0
+  "github__list_*": T0
+  "github__get_*": T0
+  "github__search_*": T0
+  "gmail__list_*": T0
+  "gmail__search_*": T0
+  "gmail__get_*": T0
+  "notion__search": T0
+  "notion__fetch": T0
+  "local__memory_search": T0
+  "local__now": T0
+
+  # --- T1: reversible, private blast radius ---
+  "gmail__create_draft": T1
+  "notion__create-pages": T1
+  "notion__update-page": T1
+  "github__create_issue": T1
+  "local__remember": T1
+
+  # --- T2: irreversible or externally visible ---
+  "gmail__send*": T2
+  "github__merge_*": T2
+  "github__create_pull_request": T2
+  "market__*": T2          # metered free tier -- ~25 req/day
+
+  # --- T3: never ---
+  "*__delete_*": T3
+  "*__remove_*": T3
+
+rules:
+  - id: deny-destructive
+    match:
+      tool: ["*__delete_*", "*__remove_*", "*__drop_*"]
+    action: deny
+    reason: "Destructive operations are disabled in this build."
+
+  - id: t2-confirm
+    match:
+      tier: [T2]
+    action: confirm
+    reason: "Irreversible or externally visible action."
+
+  # INDIRECT PROMPT INJECTION MITIGATION.
+  # Once a turn has touched web search, any subsequent write escalates to
+  # confirm. A poisoned search result can SUGGEST sending an email, but it
+  # cannot cause one silently.
+  - id: untrusted-provenance
+    match:
+      tier: [T1, T2]
+      provenance_contains: search
+    action: confirm
+    reason: "This action was influenced by untrusted web content."

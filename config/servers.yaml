@@ -1,0 +1,66 @@
+# MCP servers.
+#
+# `tools.allow` is an ALLOWLIST, not a denylist. A tool absent from it is never
+# converted into a schema, so the model cannot even name it.
+#
+# TARGET: <= 30 tools TOTAL across all servers. Groq's free tier allows only
+# 6-12K tokens/min and 40 tool schemas cost 3-5K tokens PER REQUEST -- blow that
+# and failover fails exactly when you need it.
+
+servers:
+  # GitHub is built first on purpose: remote HTTP, free PAT auth, and no
+  # subprocess, so the hub can be proven end-to-end before Windows stdio pain.
+  - id: github
+    transport: http
+    url: https://api.githubcopilot.com/mcp/
+    headers:
+      Authorization: "Bearer ${GITHUB_PAT}"
+    tools:
+      allow:
+        - search_repositories
+        - get_file_contents
+        - list_issues
+        - list_notifications
+        - create_issue
+    timeout_s: 30
+
+  # No API key, no signup, no card. Swap for Tavily (1000/mo free, still no
+  # card) if quality disappoints -- one line, no code change.
+  - id: search
+    transport: stdio
+    command: uvx
+    args: ["duckduckgo-mcp-server"]
+    tools:
+      allow: [search, fetch_content]
+    lazy: true
+    idle_kill_s: 600
+    timeout_s: 30
+
+  # LOCAL npm server + internal integration token. The hosted Notion MCP
+  # requires interactive user OAuth and rejects bearer tokens, so it cannot run
+  # headless. Bonus: an integration only sees pages you explicitly share with
+  # it -- least privilege for free.
+  - id: notion
+    transport: stdio
+    command: npx
+    args: ["-y", "@notionhq/notion-mcp-server"]
+    env:
+      NOTION_TOKEN: "${NOTION_TOKEN}"
+    tools:
+      allow: [search, fetch, create-pages, update-page]
+    lazy: true
+    idle_kill_s: 600
+
+  # SCOPES: gmail.readonly + gmail.compose ONLY. Never gmail.send in v1 --
+  # drafts-only IS the guardrail. A bad agent decision costs a bad draft, not a
+  # sent email.
+  - id: gmail
+    transport: stdio
+    command: uvx
+    args: ["workspace-mcp", "--tools", "gmail"]
+    env:
+      GOOGLE_OAUTH_CLIENT_SECRETS: "${GOOGLE_OAUTH_CLIENT_SECRETS}"
+    tools:
+      allow: [search_gmail_messages, get_gmail_message_content, draft_gmail_message]
+    lazy: true
+    idle_kill_s: 900
