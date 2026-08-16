@@ -1,0 +1,203 @@
+"""Provider router: Gemini primary, Groq fallback.
+
+STICKY PER SESSION, NOT PER REQUEST. Flapping between providers mid-loop would
+re-serialise the whole history into the other dialect and re-pay the tool-schema
+token cost on both sides. So once we switch, we stay switched until the demotion
+expires.
+
+Failover triggers (from ProviderError.should_failover):
+    rate_limit / quota / overloaded / timeout   -> switch
+    bad_request                                 -> NEVER. That is a schema
+                                                   sanitiser bug and must
+                                                   surface, not be masked by a
+                                                   retry on the other provider.
+
+Switching mid-conversation is safe because canonical history lives in neutral
+`Msg` objects and each adapter renders on demand -- a switch is just "render
+the same list with the other renderer". Gemini-issued tool calls carry
+synthesised ids, so Groq can build a legal tool message from them.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+
+from mehullm.llm.quota import Limits, QuotaStore, day_pt
+from mehullm.llm.types import (
+    LLMClient,
+    LLMEvent,
+    Msg,
+    ProviderError,
+    StreamEnd,
+    ToolDef,
+    UsageEvent,
+)
+
+RATE_LIMIT_DEMOTE_S = 15 * 60
+TRANSIENT_DEMOTE_S = 5 * 60
+SHORT_RETRY_MAX_S = 8.0
+
+
+def _seconds_to_pt_midnight() -> float:
+    """Quota resets at midnight Pacific, not local midnight."""
+    import datetime as _dt
+
+    from mehullm.llm.quota import PT
+
+    now = _dt.datetime.now(PT)
+    tomorrow = (now + _dt.timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return (tomorrow - now).total_seconds()
+
+
+@dataclass
+class Provider:
+    client: LLMClient
+    limits: Limits
+    priority: int = 0
+
+
+@dataclass
+class RouterEvent:
+    """Emitted when the active provider changes, so the UI can show it."""
+
+    from_provider: str
+    to_provider: str
+    reason: str
+
+
+@dataclass
+class LLMRouter:
+    providers: list[Provider]
+    quota: QuotaStore
+    _active: str | None = None
+    _switch_log: list[RouterEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.providers.sort(key=lambda p: p.priority)
+
+
+    def _by_name(self, name: str) -> Provider | None:
+        return next((p for p in self.providers if p.client.name == name), None)
+
+    def available(self) -> list[Provider]:
+        return [p for p in self.providers if self.quota.is_available(p.client.name, p.limits)]
+
+    def pick(self) -> Provider:
+        """Sticky: keep the current provider while it is still usable."""
+        if self._active:
+            cur = self._by_name(self._active)
+            if cur and self.quota.is_available(cur.client.name, cur.limits):
+                return cur
+        for p in self.providers:
+            if self.quota.is_available(p.client.name, p.limits):
+                self._note_switch(p.client.name, "preflight")
+                return p
+        # Everything is exhausted. Take the primary and let the real error
+        # surface rather than inventing a synthetic one.
+        return self.providers[0]
+
+    def _note_switch(self, to: str, reason: str) -> None:
+        if self._active and self._active != to:
+            self._switch_log.append(RouterEvent(self._active, to, reason))
+        self._active = to
+
+    def drain_switches(self) -> list[RouterEvent]:
+        out, self._switch_log = self._switch_log, []
+        return out
+
+    def _demote(self, provider: str, err: ProviderError) -> None:
+        if err.kind == "quota":
+            until = time.time() + _seconds_to_pt_midnight()
+            self.quota.note_rate_limited(provider)
+        elif err.kind == "rate_limit":
+            until = time.time() + RATE_LIMIT_DEMOTE_S
+            self.quota.note_rate_limited(provider)
+        else:
+            until = time.time() + TRANSIENT_DEMOTE_S
+        self.quota.demote(provider, until, f"{err.kind}: {err}")
+
+
+    async def stream(
+        self,
+        *,
+        system: str,
+        messages: list[Msg],
+        tools: list[ToolDef],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[LLMEvent]:
+        """Stream from the best available provider, failing over on the way.
+
+        Emitted events are committed only when a provider completes. If one
+        dies mid-stream we discard its partial output and replay the whole turn
+        on the next provider -- a half-turn from one model spliced onto a
+        half-turn from another is worse than a short visible restart.
+        """
+        tried: set[str] = set()
+        last: ProviderError | None = None
+
+        for _ in range(len(self.providers)):
+            provider = self.pick()
+            name = provider.client.name
+            if name in tried:
+                remaining = [p for p in self.providers if p.client.name not in tried]
+                if not remaining:
+                    break
+                provider = remaining[0]
+                name = provider.client.name
+            tried.add(name)
+            self._note_switch(name, "start")
+
+            buffered: list[LLMEvent] = []
+            usage_in = usage_out = 0
+            try:
+                async for ev in provider.client.stream(
+                    system=system, messages=messages, tools=tools, max_tokens=max_tokens
+                ):
+                    if isinstance(ev, UsageEvent):
+                        usage_in += ev.usage.input_tokens
+                        usage_out += ev.usage.output_tokens
+                    buffered.append(ev)
+                    yield ev
+                    if isinstance(ev, StreamEnd):
+                        break
+            except ProviderError as e:
+                last = e
+                self.quota.record(
+                    name, provider.client.model, ok=False, error_kind=e.kind
+                )
+                if not e.should_failover:
+                    raise  # bad_request / auth: surface it, do not mask it
+                self._demote(name, e)
+                if buffered:
+                    # Partial output already went to the client. Signal the
+                    # restart rather than silently splicing two models together.
+                    yield StreamEnd("provider_switch")
+                continue
+
+            self.quota.record(
+                name, provider.client.model, input_tokens=usage_in, output_tokens=usage_out
+            )
+            return
+
+        raise last or ProviderError("quota", "all providers exhausted")
+
+
+    def status(self) -> dict:
+        return {
+            "active": self._active,
+            "day_pt": day_pt(),
+            "providers": [
+                {
+                    "name": p.client.name,
+                    "model": p.client.model,
+                    "available": self.quota.is_available(p.client.name, p.limits),
+                    "limits": {"rpm": p.limits.rpm, "rpd": p.limits.rpd},
+                    **self.quota.snapshot().get(p.client.name, {}),
+                }
+                for p in self.providers
+            ],
+        }
