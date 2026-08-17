@@ -68,8 +68,12 @@ CREATE TABLE IF NOT EXISTS facts (
 CREATE INDEX IF NOT EXISTS ix_facts_sp ON facts(subject, predicate);
 CREATE INDEX IF NOT EXISTS ix_facts_status ON facts(status);
 
+-- `porter` stems on both sides, so a query for "live" reaches "Mehul lives in
+-- Hyderabad". Without it that fact could not be matched lexically at all, and
+-- fusion buried it under facts that merely happened to contain the word "live".
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
-  text, content='facts', content_rowid='id'
+  text, content='facts', content_rowid='id',
+  tokenize='porter unicode61 remove_diacritics 2'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
   fact_id INTEGER PRIMARY KEY, embedding float[{DIM}]
