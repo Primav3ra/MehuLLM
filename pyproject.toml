@@ -31,6 +31,7 @@ server = [
     "google-genai>=2.18,<3",
     "openai>=1.54",              # pointed at Groq's OpenAI-compatible endpoint
     "mcp>=2.0",
+    "psutil>=6.0",               # free-RAM in /api/health; this box runs near the limit
 ]
 # Local embeddings + vector store (week 4+). fastembed is ONNX -- NO torch, deliberately.
 memory = [
