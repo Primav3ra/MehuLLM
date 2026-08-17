@@ -20,6 +20,8 @@ synthesised ids, so Groq can build a legal tool message from them.
 
 from __future__ import annotations
 
+import asyncio
+import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -38,6 +40,13 @@ from mehullm.llm.types import (
 RATE_LIMIT_DEMOTE_S = 15 * 60
 TRANSIENT_DEMOTE_S = 5 * 60
 SHORT_RETRY_MAX_S = 8.0
+
+# Retried in place before any failover. `rate_limit` is included because a
+# short 429 blip is usually cheaper to wait out than to re-pay the tool-schema
+# token cost on the other provider.
+_RETRY_IN_PLACE = frozenset({"overloaded", "timeout", "rate_limit"})
+_TRANSIENT_RETRIES = 2
+_RETRY_BASE_S = 1.5
 
 
 def _seconds_to_pt_midnight() -> float:
@@ -154,16 +163,33 @@ class LLMRouter:
             buffered: list[LLMEvent] = []
             usage_in = usage_out = 0
             try:
-                async for ev in provider.client.stream(
-                    system=system, messages=messages, tools=tools, max_tokens=max_tokens
-                ):
-                    if isinstance(ev, UsageEvent):
-                        usage_in += ev.usage.input_tokens
-                        usage_out += ev.usage.output_tokens
-                    buffered.append(ev)
-                    yield ev
-                    if isinstance(ev, StreamEnd):
+                # Transient failures get ONE in-place retry before failover.
+                # Without it a 503 "high demand" -- which Gemini returns
+                # routinely -- kills the turn outright whenever there is no
+                # second provider configured. Nothing has been yielded yet at
+                # this point, so retrying is invisible to the client.
+                for attempt in range(_TRANSIENT_RETRIES + 1):
+                    try:
+                        async for ev in provider.client.stream(
+                            system=system, messages=messages, tools=tools,
+                            max_tokens=max_tokens,
+                        ):
+                            if isinstance(ev, UsageEvent):
+                                usage_in += ev.usage.input_tokens
+                                usage_out += ev.usage.output_tokens
+                            buffered.append(ev)
+                            yield ev
+                            if isinstance(ev, StreamEnd):
+                                break
                         break
+                    except ProviderError as e:
+                        retriable = e.kind in _RETRY_IN_PLACE and not buffered
+                        if attempt >= _TRANSIENT_RETRIES or not retriable:
+                            raise
+                        delay = e.retry_after or _RETRY_BASE_S * (2 ** attempt)
+                        # Jitter so concurrent runs do not retry in lockstep.
+                        await asyncio.sleep(min(delay, 8.0) * (0.5 + random.random()))
+                        self._note_switch(name, f"retry:{e.kind}")
             except ProviderError as e:
                 last = e
                 self.quota.record(

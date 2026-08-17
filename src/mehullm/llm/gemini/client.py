@@ -66,6 +66,12 @@ class GeminiClient:
         self._client = genai.Client(api_key=api_key)
         self.model = model
         self._turn = 0
+        # Gemini 3.x returns an encrypted `thought_signature` on every
+        # functionCall part and REJECTS the next request with 400 if it is not
+        # echoed back. It is provider-opaque and meaningless to Groq, so it is
+        # cached here, keyed by the synthetic call id, and never enters
+        # canonical history -- a failover simply drops it.
+        self._sigs: dict[str, Any] = {}
 
 
     def _to_contents(self, messages: list[Msg]) -> list[Any]:
@@ -93,7 +99,10 @@ class GeminiClient:
             if m.text:
                 parts.append(types.Part.from_text(text=m.text))
             for tc in m.tool_calls:
-                parts.append(types.Part.from_function_call(name=tc.name, args=tc.args))
+                fp = types.Part.from_function_call(name=tc.name, args=tc.args)
+                if sig := self._sigs.get(tc.id):
+                    fp.thought_signature = sig
+                parts.append(fp)
             if not parts:
                 continue
             out.append(
@@ -155,9 +164,12 @@ class GeminiClient:
                             # canonical history always has it -- without this a
                             # mid-conversation failover to Groq cannot build a
                             # legal tool message and the result degrades to text.
+                            call_id = f"call_{self._turn}_{idx}"
+                            if sig := getattr(part, "thought_signature", None):
+                                self._sigs[call_id] = sig
                             yield ToolCallReady(
                                 ToolCall(
-                                    id=f"call_{self._turn}_{idx}",
+                                    id=call_id,
                                     name=fc.name,
                                     args=dict(fc.args or {}),
                                 )

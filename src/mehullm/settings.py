@@ -15,12 +15,21 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.5-flash"
+    # NOT gemini-3.5-flash: its free tier is 20 requests PER DAY, and one agent
+    # turn costs 2-3. Measured, not guessed -- the 429 names the quota
+    # explicitly. The -lite tier is far more generous and still calls tools.
+    gemini_model: str = "gemini-3.5-flash-lite"
     gemini_rpm_guess: int = 10
-    gemini_rpd_guess: int = 250
+    # Deliberately conservative. Google no longer publishes free-tier limits, so
+    # the quota store LEARNS the real ceiling from 429s rather than trusting this.
+    gemini_rpd_guess: int = 200
 
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    # NOT llama-3.3-70b-versatile: Groq rejects its tool calls server-side
+    # ("Failed to call a function"), and the model leaks `<function=...>` as
+    # plain text into the answer. Verified working alternatives with real tool
+    # schemas: openai/gpt-oss-20b and llama-3.1-8b-instant.
+    groq_model: str = "openai/gpt-oss-20b"
 
     ollama_host: str = "http://localhost:11434"
     ollama_voice_model: str = "mehul-voice"
@@ -32,6 +41,8 @@ class Settings(BaseSettings):
     mehullm_cors_origins: str = "http://localhost:3000"
 
     mehullm_db: str = str(ROOT / "data" / "derived" / "mehullm.db")
+    memory_db: str = str(ROOT / "data" / "derived" / "memory.db")
+    memory_facts_k: int = 8
     mehullm_derived_dir: str = str(ROOT / "data" / "derived")
 
     mehullm_max_tool_calls_per_turn: int = 25
