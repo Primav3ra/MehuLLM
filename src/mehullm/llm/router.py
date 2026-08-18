@@ -1,22 +1,4 @@
-"""Provider router: Gemini primary, Groq fallback.
-
-STICKY PER SESSION, NOT PER REQUEST. Flapping between providers mid-loop would
-re-serialise the whole history into the other dialect and re-pay the tool-schema
-token cost on both sides. So once we switch, we stay switched until the demotion
-expires.
-
-Failover triggers (from ProviderError.should_failover):
-    rate_limit / quota / overloaded / timeout   -> switch
-    bad_request                                 -> NEVER. That is a schema
-                                                   sanitiser bug and must
-                                                   surface, not be masked by a
-                                                   retry on the other provider.
-
-Switching mid-conversation is safe because canonical history lives in neutral
-`Msg` objects and each adapter renders on demand -- a switch is just "render
-the same list with the other renderer". Gemini-issued tool calls carry
-synthesised ids, so Groq can build a legal tool message from them.
-"""
+"""Provider router over the Gemini model ladder."""
 
 from __future__ import annotations
 
@@ -36,14 +18,16 @@ from mehullm.llm.types import (
     ToolDef,
     UsageEvent,
 )
+from mehullm.obs import get_logger
+from mehullm.persistence import tracing
+
+log = get_logger(__name__)
 
 RATE_LIMIT_DEMOTE_S = 15 * 60
 TRANSIENT_DEMOTE_S = 5 * 60
 SHORT_RETRY_MAX_S = 8.0
 
-# Retried in place before any failover. `rate_limit` is included because a
-# short 429 blip is usually cheaper to wait out than to re-pay the tool-schema
-# token cost on the other provider.
+# Retried in place before any failover. `rate_limit` is included because a.
 _RETRY_IN_PLACE = frozenset({"overloaded", "timeout", "rate_limit"})
 _TRANSIENT_RETRIES = 2
 _RETRY_BASE_S = 1.5
@@ -56,9 +40,7 @@ def _seconds_to_pt_midnight() -> float:
     from mehullm.llm.quota import PT
 
     now = _dt.datetime.now(PT)
-    tomorrow = (now + _dt.timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    tomorrow = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return (tomorrow - now).total_seconds()
 
 
@@ -88,7 +70,6 @@ class LLMRouter:
     def __post_init__(self) -> None:
         self.providers.sort(key=lambda p: p.priority)
 
-
     def _by_name(self, name: str) -> Provider | None:
         return next((p for p in self.providers if p.client.name == name), None)
 
@@ -105,8 +86,9 @@ class LLMRouter:
             if self.quota.is_available(p.client.name, p.limits):
                 self._note_switch(p.client.name, "preflight")
                 return p
-        # Everything is exhausted. Take the primary and let the real error
-        # surface rather than inventing a synthetic one.
+        # Everything is exhausted. Surface it, then let the real error come from
+        # the API rather than inventing a synthetic one.
+        log.warning("providers.all_exhausted", providers=[p.client.name for p in self.providers])
         return self.providers[0]
 
     def _note_switch(self, to: str, reason: str) -> None:
@@ -119,16 +101,26 @@ class LLMRouter:
         return out
 
     def _demote(self, provider: str, err: ProviderError) -> None:
-        if err.kind == "quota":
+        if err.kind in ("model_unavailable", "quota"):
             until = time.time() + _seconds_to_pt_midnight()
-            self.quota.note_rate_limited(provider)
+            if err.kind == "quota":
+                # Only a PerDay 429 teaches us a daily ceiling.
+                self.quota.note_daily_limit(provider, err.limit)
         elif err.kind == "rate_limit":
-            until = time.time() + RATE_LIMIT_DEMOTE_S
-            self.quota.note_rate_limited(provider)
+            # Per-minute. Honour Google's own retryDelay; never touch the daily
+            # ceiling, or one 16s blip caps the model for the rest of the day.
+            until = time.time() + min(err.retry_after or 60.0, RATE_LIMIT_DEMOTE_S)
         else:
             until = time.time() + TRANSIENT_DEMOTE_S
+        log.info(
+            "provider.demoted",
+            provider=provider,
+            kind=err.kind,
+            seconds=round(until - time.time()),
+            retry_after=err.retry_after,
+            reported_limit=err.limit,
+        )
         self.quota.demote(provider, until, f"{err.kind}: {err}")
-
 
     async def stream(
         self,
@@ -138,13 +130,7 @@ class LLMRouter:
         tools: list[ToolDef],
         max_tokens: int = 4096,
     ) -> AsyncIterator[LLMEvent]:
-        """Stream from the best available provider, failing over on the way.
-
-        Emitted events are committed only when a provider completes. If one
-        dies mid-stream we discard its partial output and replay the whole turn
-        on the next provider -- a half-turn from one model spliced onto a
-        half-turn from another is worse than a short visible restart.
-        """
+        """Stream from the best available provider, failing over on the way."""
         tried: set[str] = set()
         last: ProviderError | None = None
 
@@ -162,16 +148,18 @@ class LLMRouter:
 
             buffered: list[LLMEvent] = []
             usage_in = usage_out = 0
+            t_start = time.monotonic()
+            # Accounting MUST happen in a finally. This is an async generator and.
+            recorded = False
             try:
                 # Transient failures get ONE in-place retry before failover.
-                # Without it a 503 "high demand" -- which Gemini returns
-                # routinely -- kills the turn outright whenever there is no
-                # second provider configured. Nothing has been yielded yet at
-                # this point, so retrying is invisible to the client.
                 for attempt in range(_TRANSIENT_RETRIES + 1):
+                    t0 = time.monotonic()
                     try:
                         async for ev in provider.client.stream(
-                            system=system, messages=messages, tools=tools,
+                            system=system,
+                            messages=messages,
+                            tools=tools,
                             max_tokens=max_tokens,
                         ):
                             if isinstance(ev, UsageEvent):
@@ -183,18 +171,28 @@ class LLMRouter:
                                 break
                         break
                     except ProviderError as e:
+                        tracing.record_span(
+                            "llm",
+                            "llm_call",
+                            int((time.monotonic() - t0) * 1000),
+                            provider=name,
+                            model=provider.client.model,
+                            status="error",
+                            error=f"{e.kind}: {e}",
+                            attempt=attempt,
+                        )
                         retriable = e.kind in _RETRY_IN_PLACE and not buffered
                         if attempt >= _TRANSIENT_RETRIES or not retriable:
                             raise
-                        delay = e.retry_after or _RETRY_BASE_S * (2 ** attempt)
+                        self.quota.record(name, provider.client.model, ok=False, error_kind=e.kind)
+                        delay = e.retry_after or _RETRY_BASE_S * (2**attempt)
                         # Jitter so concurrent runs do not retry in lockstep.
                         await asyncio.sleep(min(delay, 8.0) * (0.5 + random.random()))
                         self._note_switch(name, f"retry:{e.kind}")
             except ProviderError as e:
                 last = e
-                self.quota.record(
-                    name, provider.client.model, ok=False, error_kind=e.kind
-                )
+                self.quota.record(name, provider.client.model, ok=False, error_kind=e.kind)
+                recorded = True
                 if not e.should_failover:
                     raise  # bad_request / auth: surface it, do not mask it
                 self._demote(name, e)
@@ -203,14 +201,28 @@ class LLMRouter:
                     # restart rather than silently splicing two models together.
                     yield StreamEnd("provider_switch")
                 continue
-
-            self.quota.record(
-                name, provider.client.model, input_tokens=usage_in, output_tokens=usage_out
-            )
+            finally:
+                # Runs on normal completion AND on generator close, which is the
+                # only reason a successful request gets counted at all.
+                tracing.record_span(
+                    "llm",
+                    "llm_call",
+                    int((time.monotonic() - t_start) * 1000),
+                    provider=name,
+                    model=provider.client.model,
+                    tokens_in=usage_in,
+                    tokens_out=usage_out,
+                )
+                if not recorded:
+                    self.quota.record(
+                        name,
+                        provider.client.model,
+                        input_tokens=usage_in,
+                        output_tokens=usage_out,
+                    )
             return
 
         raise last or ProviderError("quota", "all providers exhausted")
-
 
     def status(self) -> dict:
         return {

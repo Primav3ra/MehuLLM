@@ -1,19 +1,4 @@
-"""Irreversible PII scrubbing for the training corpus and stored traces.
-
-Runs BEFORE anything touches a model -- including the *local* ones. There is a
-separate, reversible placeholder vault at runtime (guardrails/redaction.py);
-this module is the one-way scrubber used by the data pipeline and the trace
-writer, which share these patterns deliberately: one implementation, tested
-once, so the two can never drift apart.
-
-Every pattern is anchored tightly enough that it cannot eat authored style:
-"100%", "2moro", "gn8", "yaaar", emoji and casing are untouched. Bare 6-digit
-numbers are NOT treated as OTPs without a nearby context word -- "got 250109
-views" is style data.
-
-Names are pseudonymised CONSISTENTLY (Rohan -> Person_A), never flattened to
-"<NAME>", which would destroy the turn-taking structure.
-"""
+"""Irreversible PII scrubbing for the training corpus and stored traces."""
 
 from __future__ import annotations
 
@@ -24,33 +9,26 @@ from pathlib import Path
 
 import regex
 
-__all__ = ["scrub", "scrub_with_stats", "NameMap", "PATTERNS"]
+__all__ = ["PATTERNS", "NameMap", "scrub", "scrub_with_stats"]
 
-# Digit class covering ASCII and Devanagari numerals. Indian phone numbers do
-# get typed in Devanagari digits. Matching on a normalised *copy* and writing
-# back by index would be fiddly and bug-prone, so the classes are widened
-# instead -- the original text is never mutated for matching purposes.
+# Digit class covering ASCII and Devanagari numerals. Indian phone numbers do.
 _D = r"[0-9०-९]"
 
 PATTERNS: dict[str, regex.Pattern] = {
     "EMAIL": regex.compile(r"\b[\w.\-+]+@[\w\-]+\.[\w.\-]{2,}\b"),
     "URL": regex.compile(r"https?://\S+|\bwww\.[\w\-]+\.\w{2,}\S*"),
-    # UPI handles: mehul@okicici, 9876543210@ybl
+    # UPI handles: mehul@okicici, 9876543210@ybl.
     "UPI": regex.compile(
         r"\b[\w.\-]{2,}@(?:ok(?:icici|hdfcbank|axis|sbi)|paytm|ybl|upi|apl|ibl|axl)\b",
         regex.IGNORECASE,
     ),
     # PAN: 5 letters, 4 digits, 1 letter. Very specific, safe.
     "PAN": regex.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b"),
-    # Aadhaar: exactly 12 digits, optionally spaced 4-4-4. The trailing
-    # lookahead stops it from swallowing the first 12 digits of a 16-digit
-    # card number and leaking the last four (regression: test_catches_pii).
+    # Aadhaar: exactly 12 digits, optionally spaced 4-4-4. The trailing.
     "AADHAAR": regex.compile(rf"\b{_D}{{4}}\s?{_D}{{4}}\s?{_D}{{4}}\b(?![\s\-]?{_D})"),
     # Indian mobile: optional +91/0 prefix, then 10 digits starting 6-9.
-    # NOTE the leading class is [6-9६-९], not [6-9] -- a Devanagari-typed
-    # number starts with ६-९ and an ASCII-only class silently misses it.
     "PHONE": regex.compile(rf"(?<!{_D})(?:\+?91[\-\s]?|0)?[6-9६-९]{_D}{{9}}(?!{_D})"),
-    # Vehicle registration: MH12AB1234
+    # Vehicle registration: MH12AB1234.
     "VEHICLE": regex.compile(rf"\b[A-Z]{{2}}{_D}{{2}}[A-Z]{{1,2}}{_D}{{4}}\b"),
     # OTP -- REQUIRES a context word. A bare 6-digit number is left alone.
     "OTP": regex.compile(
@@ -78,11 +56,6 @@ PATTERNS: dict[str, regex.Pattern] = {
 }
 
 # Order is load-bearing, for two independent reasons:
-#   1. EMAIL/URL/UPI run before PHONE, or a phone-like digit run inside a URL
-#      is clobbered first and the URL pattern then fails to match.
-#   2. CARD runs before AADHAAR. Both are digit-group patterns and the longer
-#      one must win; reversed, a 16-digit card matched as a 12-digit Aadhaar
-#      and leaked its final four digits.
 _ORDER = [
     "EMAIL",
     "URL",
@@ -104,14 +77,7 @@ def scrub(text: str) -> str:
     return scrub_with_stats(text)[0]
 
 
-# Two-tier OTP handling. The patterns above need the keyword and the digits to
-# sit close together, which a real leak scan showed is not always true --
-# "your OTP for order 4471 placed on ... is 903112" puts them far apart.
-#
-# So: if a message MENTIONS an OTP at all, scrub every short digit run in it.
-# This is safe precisely because it is context-gated. Ordinary messages never
-# say "OTP", so no authored style ("got 250109 views", "100%") is ever exposed
-# to the aggressive rule.
+# Two-tier OTP handling. The patterns above need the keyword and the digits to.
 _OTP_KEYWORD_RE = regex.compile(
     r"\b(?:OTP|O\.T\.P|one[\s\-]?time\s*(?:password|code|pin)|verification\s+code)\b",
     regex.IGNORECASE,
@@ -143,19 +109,12 @@ def scrub_with_stats(text: str) -> tuple[str, Counter[str]]:
     return text, found
 
 
-# Consistent name pseudonymisation
+# Consistent name pseudonymisation.
 
 
 @dataclass
 class NameMap:
-    """Stable ``Rohan -> Person_A`` mapping across the whole corpus.
-
-    Consistency is the point. Flattening every name to one token would erase
-    who-is-talking-to-whom, which is exactly the structure the model needs.
-
-    The owner's own name is deliberately NOT pseudonymised -- the assistant
-    should learn to respond to it.
-    """
+    """Stable ``Rohan -> Person_A`` mapping across the whole corpus."""
 
     mapping: dict[str, str] = field(default_factory=dict)
     keep: set[str] = field(default_factory=set)  # names left verbatim (the owner)
@@ -190,7 +149,6 @@ class NameMap:
             text = pattern.sub(self.alias_for(name), text)
         return text
 
-
     def save(self, path: str | Path) -> None:
         Path(path).write_text(
             json.dumps(
@@ -207,4 +165,6 @@ class NameMap:
         if not p.exists():
             return cls()
         d = json.loads(p.read_text(encoding="utf-8"))
-        return cls(mapping=d.get("mapping", {}), keep=set(d.get("keep", [])), _next=d.get("next", 0))
+        return cls(
+            mapping=d.get("mapping", {}), keep=set(d.get("keep", [])), _next=d.get("next", 0)
+        )

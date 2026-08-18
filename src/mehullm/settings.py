@@ -15,25 +15,25 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    # NOT gemini-3.5-flash: its free tier is 20 requests PER DAY, and one agent
-    # turn costs 2-3. Measured, not guessed -- the 429 names the quota
-    # explicitly. The -lite tier is far more generous and still calls tools.
+    # NOT gemini-3.5-flash: its free tier is 20 requests PER DAY, and one agent.
     gemini_model: str = "gemini-3.5-flash-lite"
-    gemini_rpm_guess: int = 10
+    # A LADDER, because free-tier quota is per-model.
+    gemini_models: str = (
+        "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.7-flash,"
+        "gemini-3.1-flash-lite,gemini-3.1-flash-lite-preview,"
+        "gemini-3-flash-preview,gemini-3.5-flash"
+    )
+    gemini_rpm_guess: int = 5  # measured from the 429 quotaValue, not guessed
     # Deliberately conservative. Google no longer publishes free-tier limits, so
     # the quota store LEARNS the real ceiling from 429s rather than trusting this.
     gemini_rpd_guess: int = 200
 
-    groq_api_key: str = ""
-    # NOT llama-3.3-70b-versatile: Groq rejects its tool calls server-side
-    # ("Failed to call a function"), and the model leaks `<function=...>` as
-    # plain text into the answer. Verified working alternatives with real tool
-    # schemas: openai/gpt-oss-20b and llama-3.1-8b-instant.
-    groq_model: str = "openai/gpt-oss-20b"
-
     ollama_host: str = "http://localhost:11434"
     ollama_voice_model: str = "mehul-voice"
     ollama_base_model: str = "qwen3:1.7b"
+
+    log_level: str = "INFO"
+    log_file: str = str(ROOT / "data" / "derived" / "mehullm.log")
 
     mehullm_api_token: str = ""
     mehullm_host: str = "127.0.0.1"
@@ -56,6 +56,20 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.mehullm_cors_origins.split(",") if o.strip()]
+
+    @staticmethod
+    def _ladder(raw: str, primary: str) -> list[str]:
+        """Primary first, then the rest, de-duplicated, order preserved."""
+        out: list[str] = []
+        for m in [primary, *raw.split(",")]:
+            m = m.strip()
+            if m and m not in out:
+                out.append(m)
+        return out
+
+    @property
+    def gemini_model_list(self) -> list[str]:
+        return self._ladder(self.gemini_models, self.gemini_model)
 
 
 settings = Settings()

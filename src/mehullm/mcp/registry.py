@@ -1,18 +1,4 @@
-"""Tool registry: namespacing across servers + MCP -> neutral schema.
-
-This is the part of the MCP client that is genuinely ours. The wire layer
-(JSON-RPC framing, protocol-era negotiation, transport headers) is delegated to
-the official SDK; federation, naming and budgeting are here.
-
-Three rules that come from things that break:
-
-* NEVER parse the tool name the model returns. Always dict-lookup. Splitting on
-  "__" breaks the instant a server ships a tool called `get__file`.
-* Truncate long names with a HASH SUFFIX, never a bare slice -- slicing
-  silently collides two different tools into one name.
-* Sort the tool list. An unsorted list is a silent prompt-cache invalidator and,
-  on Groq's 6-12K TPM ceiling, schema bloat is a hard failure not a cost.
-"""
+"""Tool registry: namespacing across servers + MCP -> neutral schema."""
 
 from __future__ import annotations
 
@@ -31,19 +17,22 @@ SEP = "__"
 @dataclass(frozen=True, slots=True)
 class ToolRef:
     server_id: str
-    tool_name: str          # the name as the server knows it
-    namespaced: str         # the name the model sees
+    tool_name: str  # the name as the server knows it
+    namespaced: str  # the name the model sees
     annotations: dict[str, Any] = field(default_factory=dict)
 
     @property
     def read_only_hint(self) -> bool:
-        """Server-supplied and therefore UNTRUSTED.
-
-        Only ever used to auto-classify tools the policy file does not mention,
-        and only in the permissive direction. A malicious server claiming
-        readOnlyHint on its delete_everything tool must not be able to escalate.
-        """
+        """Server-supplied and therefore UNTRUSTED."""
         return bool(self.annotations.get("readOnlyHint"))
+
+
+def glob_match(pattern: str, name: str) -> bool:
+    """`*` only. NOT fnmatch: its ? and [seq] would silently reinterpret configs."""
+    if "*" not in pattern:
+        return pattern == name
+    rx = "^" + ".*".join(re.escape(p) for p in pattern.split("*")) + "$"
+    return re.match(rx, name) is not None
 
 
 def namespace(server_id: str, tool_name: str) -> str:
@@ -65,8 +54,7 @@ class Registry:
         tools: list[Any],
         allow: set[str] | None = None,
     ) -> int:
-        """Register a server's tools. `allow` is an ALLOWLIST, not a denylist --
-        an absent tool never becomes a schema, so the model cannot name it."""
+        """Register a server's tools."""
         added = 0
         for t in sorted(tools, key=lambda x: getattr(x, "name", "")):
             name = getattr(t, "name", None)
@@ -93,8 +81,7 @@ class Registry:
         return added
 
     def drop_server(self, server_id: str) -> None:
-        """Called when a server dies. Its tools vanish from the next turn's
-        schema rather than being offered and then failing."""
+        """Called when a server dies."""
         for ns in [k for k, v in self._refs.items() if v.server_id == server_id]:
             self._refs.pop(ns, None)
             self._defs.pop(ns, None)
@@ -124,4 +111,7 @@ class Registry:
         """Rough guard for the TPM ceiling. 30 tools is roughly the budget."""
         import json
 
-        return sum(len(json.dumps(d.parameters)) + len(d.description) for d in self._defs.values()) // 4
+        return (
+            sum(len(json.dumps(d.parameters)) + len(d.description) for d in self._defs.values())
+            // 4
+        )

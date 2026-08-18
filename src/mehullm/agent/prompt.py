@@ -1,20 +1,4 @@
-"""System prompt assembly.
-
-Order matters for prompt caching: stable content first, volatile content last.
-No `datetime.now()` anywhere in the cached prefix -- a timestamp at the top
-invalidates the whole thing on every single request.
-
-Four contracts the model must be told about explicitly, because each one has a
-matching mechanism in the code that will otherwise look like a malfunction:
-
-* VOICE     -- the final answer gets rewritten by another model, so state facts
-               explicitly and avoid heavy markdown that will not survive.
-* GUARDRAIL -- denial is a NORMAL outcome. Without this the model treats a
-               declined tool as an error and retry-loops on it.
-* UNTRUSTED -- search results and email bodies are data, never instructions.
-* PLACEHOLDER -- PII arrives as ⟦PII_EMAIL_3⟧ and must be passed through
-               verbatim; guessing the real value defeats the vault.
-"""
+"""System prompt assembly."""
 
 from __future__ import annotations
 
@@ -47,6 +31,8 @@ substituted at the last moment. Never guess, expand or reconstruct the real valu
 MEMORY_HEADER = """<memory>
 {facts}
 </memory>
+These facts are ALREADY retrieved. Do not call local__memory_search for anything \
+answerable from the block above -- it is the result of that search.
 Cite fact ids inline as [F142] when you rely on them. If the answer is not in \
 <memory> and not something you can look up with a tool, say so plainly."""
 

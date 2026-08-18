@@ -1,17 +1,4 @@
-"""Index WhatsApp exports into the memory store.
-
-CPU-ONLY (fastembed is ONNX), so this can run while the GPU is busy with draft
-generation. Fact extraction is the part that needs the LLM, and it queues.
-
-Indexes:
-  * style exemplars -- Mehul's own turns, for the voice model's few-shot baseline
-  * session chunks  -- whole exchanges, for the brain's retrieval AND as the
-                       unit of work for fact extraction
-
-Group chats ARE indexed here, unlike in build_sft.py. They were excluded as SFT
-targets because group voice differs, but they are perfectly good sources of
-facts about his life.
-"""
+"""Index WhatsApp exports into the memory store."""
 
 from __future__ import annotations
 
@@ -59,25 +46,31 @@ def _iter_units(raw_dir: Path, self_aliases: set[str]) -> Iterator[tuple[str, di
             # Style exemplars: only Mehul's own turns, and only substantial ones.
             for turn in session.turns:
                 if turn.sender.casefold() in folded and 12 <= len(turn.text) <= 400:
-                    yield scrub(turn.text), {
-                        "kind": "style",
-                        "chat_id": chat.chat_id,
-                        "session_id": sid,
-                        "speaker": "self",
-                        "ts": int(turn.ts_start.timestamp()),
-                    }
+                    yield (
+                        scrub(turn.text),
+                        {
+                            "kind": "style",
+                            "chat_id": chat.chat_id,
+                            "session_id": sid,
+                            "speaker": "self",
+                            "ts": int(turn.ts_start.timestamp()),
+                        },
+                    )
 
             # Session chunk: the retrievable unit, and the unit of extraction.
             body = "\n".join(f"{t.sender}: {t.text}" for t in session.turns)
             if len(body) < 40:
                 continue
-            yield scrub(body[:MAX_SESSION_CHARS]), {
-                "kind": "doc",
-                "chat_id": chat.chat_id,
-                "session_id": sid,
-                "speaker": "",
-                "ts": int(session.turns[0].ts_start.timestamp()),
-            }
+            yield (
+                scrub(body[:MAX_SESSION_CHARS]),
+                {
+                    "kind": "doc",
+                    "chat_id": chat.chat_id,
+                    "session_id": sid,
+                    "speaker": "",
+                    "ts": int(session.turns[0].ts_start.timestamp()),
+                },
+            )
 
 
 def index(

@@ -1,16 +1,8 @@
-"""Parse WhatsApp `Export chat` text files into structured messages.
-
-HEADER_RE decides "new message?" (a line failing it is a continuation of the
-previous one); BODY_RE splits sender from text (a line failing it is a system
-event).
-
-Normalises as little as possible -- the corpus exists to capture how one person
-writes. NFC only, never NFKC/NFKD (which decompose Devanagari matras). ZWJ/ZWNJ
-are kept: load-bearing in conjuncts and emoji.
-"""
+"""Parse WhatsApp `Export chat` text files into structured messages."""
 
 from __future__ import annotations
 
+import itertools
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -19,9 +11,9 @@ from pathlib import Path
 
 import regex
 
-__all__ = ["Message", "Chat", "parse_export", "parse_text"]
+__all__ = ["Chat", "Message", "parse_export", "parse_text"]
 
-# Character-level normalisation
+# Character-level normalisation.
 
 # Control marks WhatsApp injects into exports. These are exporter artifacts,
 # not authored content, and they silently break naive regexes.
@@ -40,14 +32,10 @@ _INVISIBLE = dict.fromkeys(
     None,
 )
 
-# NBSP variants -> plain space. iOS uses U+202F (NARROW NO-BREAK SPACE) between
-# the time and AM/PM, which is the single most common cause of "my regex works
-# on Android exports but not iOS".
+# NBSP variants -> plain space. iOS uses U+202F (NARROW NO-BREAK SPACE) between.
 _NBSP = str.maketrans({" ": " ", " ": " ", " ": " ", " ": " "})
 
-# NOTE: we deliberately do NOT strip ZWJ (U+200D) or ZWNJ (U+200C) -- they are
-# load-bearing inside Devanagari conjuncts and inside emoji sequences
-# (e.g. family emoji, profession emoji).
+# NOTE: we deliberately do NOT strip ZWJ (U+200D) or ZWNJ (U+200C) -- they are.
 
 
 def normalize_line(line: str) -> str:
@@ -55,7 +43,7 @@ def normalize_line(line: str) -> str:
     return unicodedata.normalize("NFC", line.translate(_INVISIBLE).translate(_NBSP))
 
 
-# Stage 1: message header
+# Stage 1: message header.
 
 HEADER_RE = regex.compile(
     r"""
@@ -74,8 +62,6 @@ HEADER_RE = regex.compile(
 
 # Stage 2: sender / text
 # '~' prefixes a non-contact participant's push name in group exports.
-# Sender is non-greedy and colon-free so "me: check this: link" splits at the
-# FIRST colon, giving sender="me", text="check this: link".
 BODY_RE = regex.compile(
     r"^~?\s*(?P<sender>[^:\n]{1,80}?):(?:[ ](?P<text>.*))?$",
     regex.DOTALL,
@@ -83,11 +69,6 @@ BODY_RE = regex.compile(
 
 # Checked BEFORE BODY_RE: system notices containing a colon would otherwise be
 # mis-split into a bogus sender.
-#
-# Every alternation is anchored and the actor prefix bounded by `[^:\n]{0,60}`.
-# Unbounded `.*\ added\b` branches backtracked quadratically -- minutes instead
-# of seconds on 25 MB. The colon-free class also stops "Mehul: I left home"
-# reaching the `left` verb, so it is faster and more correct at once.
 _SYSTEM_RE = regex.compile(
     r"""
     ^(?:
@@ -141,9 +122,7 @@ _EDITED_SUFFIX_RE = regex.compile(r"\s*<\s*This message was edited\s*>\s*$", reg
 
 _POLL_RE = regex.compile(r"^\s*POLL:\s", regex.IGNORECASE)
 
-# Call notices carry a SENDER ("Rohan: Missed voice call"), so they arrive via
-# BODY_RE as ordinary messages and must be classified at the message level --
-# not in _SYSTEM_RE, which only sees senderless lines.
+# Call notices carry a SENDER ("Rohan: Missed voice call"), so they arrive via.
 _CALL_NOTICE_RE = regex.compile(
     r"^\s*(?:Missed\ (?:voice|video|group)\ call|Video\ call|Voice\ call|"
     r"(?:Call|Video)\ (?:ended|declined|unanswered)|No\ answer|Tap\ to\ call\ back)\s*$",
@@ -155,7 +134,7 @@ _CALL_NOTICE_RE = regex.compile(
 _DEVANAGARI_RE = regex.compile(r"\p{Devanagari}")
 
 
-# Data model
+# Data model.
 
 
 @dataclass(slots=True)
@@ -172,11 +151,9 @@ class Message:
     @property
     def is_content(self) -> bool:
         """True only for real, usable authored text."""
-        return not (self.is_system or self.is_media or self.is_tombstone) and bool(self.text.strip())
-
-    @property
-    def has_devanagari(self) -> bool:
-        return bool(_DEVANAGARI_RE.search(self.text))
+        return not (self.is_system or self.is_media or self.is_tombstone) and bool(
+            self.text.strip()
+        )
 
 
 @dataclass(slots=True)
@@ -197,26 +174,18 @@ class Chat:
         return [m for m in self.messages if m.is_content]
 
 
-# Date-order resolution -- decided ONCE PER FILE, never per line
+# Date-order resolution -- decided ONCE PER FILE, never per line.
 
 
 def _resolve_date_order(pairs: list[tuple[int, int, int]]) -> tuple[str, str]:
-    """Decide whether the file is DD/MM, MM/DD, or YYYY-MM-DD.
-
-    Per-line guessing produces silent, non-obvious corruption (03/04 and 04/03
-    both parse), so this looks at the whole file and commits to one reading.
-    """
+    """Decide whether the file is DD/MM, MM/DD, or YYYY-MM-DD."""
     if not pairs:
         return "day_first", "no dates found; defaulted to day-first"
 
     if any(f1 > 31 for f1, _, _ in pairs):
         return "year_first", "field 1 exceeds 31 -> ISO-style year-first"
 
-    # Count evidence rather than trusting the FIRST hit. A single malformed
-    # line -- a pasted date, a "13/14 done" in a message body that happens to
-    # satisfy the header shape -- would otherwise flip every timestamp in a
-    # 180k-message file. Observed in the real corpus: one such line against
-    # 14,185 contrary ones.
+    # Count evidence rather than trusting the FIRST hit. A single malformed.
     n1 = sum(1 for f1, _, _ in pairs if f1 > 12)
     n2 = sum(1 for _, f2, _ in pairs if f2 > 12)
 
@@ -242,7 +211,7 @@ def _resolve_date_order(pairs: list[tuple[int, int, int]]) -> tuple[str, str]:
                 seq.append(datetime(_full_year(f3), m, d))
             except ValueError:
                 bad += 1
-        bad += sum(1 for a, b in zip(seq, seq[1:], strict=False) if b < a)
+        bad += sum(1 for a, b in itertools.pairwise(seq) if b < a)
         return bad
 
     df, mf = monotonic(True), monotonic(False)
@@ -257,7 +226,7 @@ def _full_year(y: int) -> int:
     return y if y >= 1000 else 2000 + y
 
 
-# Parsing
+# Parsing.
 
 
 def parse_text(raw: str, chat_id: str = "chat", path: Path | None = None) -> Chat:
@@ -365,11 +334,7 @@ def _finalize(msg: Message) -> Message:
 
 
 def parse_export(path: str | Path, chat_id: str | None = None) -> Chat:
-    """Parse one exported chat file.
-
-    Reads as UTF-8 with BOM tolerance; WhatsApp writes UTF-8 but Windows tools
-    frequently re-save with a BOM.
-    """
+    """Parse one exported chat file."""
     p = Path(path)
     raw = p.read_text(encoding="utf-8-sig", errors="replace")
     return parse_text(raw, chat_id=chat_id or p.stem, path=p)

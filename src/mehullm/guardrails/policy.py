@@ -1,23 +1,14 @@
-"""Risk tiers and the allow / deny / confirm decision.
-
-FAIL CLOSED. `default_action: confirm` means a newly added server's tools
-*prompt* rather than fire. A denylist would silently auto-allow them, which is
-the wrong default for something that can send email.
-
-Server-supplied `annotations` (readOnlyHint, destructiveHint) are UNTRUSTED.
-They only auto-classify tools the policy file does not mention, only in the
-permissive direction, and never override an explicit tier. A compromised server
-claiming readOnlyHint on its delete_everything tool must not be able to escalate.
-"""
+"""Risk tiers and the allow / deny / confirm decision."""
 
 from __future__ import annotations
 
-import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+from mehullm.mcp.registry import glob_match
 
 Action = Literal["allow", "deny", "confirm"]
 Tier = Literal["T0", "T1", "T2", "T3"]
@@ -35,7 +26,7 @@ class Rule:
     reason: str = ""
 
     def matches(self, tool: str, tier: str, provenance: set[str]) -> bool:
-        if self.tools and not any(fnmatch.fnmatch(tool, p) for p in self.tools):
+        if self.tools and not any(glob_match(p, tool) for p in self.tools):
             return False
         if self.tiers and tier not in self.tiers:
             return False
@@ -76,7 +67,7 @@ class Policy:
         raw: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         return cls(
             default_action=raw.get("default_action", "confirm"),
-            tiers={k: v for k, v in (raw.get("tiers") or {}).items()},
+            tiers=dict((raw.get("tiers") or {}).items()),
             limits=Limits(**(raw.get("limits") or {})),
             rules=[
                 Rule(
@@ -93,7 +84,7 @@ class Policy:
 
     def tier_for(self, tool: str, read_only_hint: bool = False) -> Tier:
         for pattern, tier in self.tiers.items():
-            if fnmatch.fnmatch(tool, pattern):
+            if glob_match(pattern, tool):
                 return tier  # type: ignore[return-value]
         # Unclassified. A server's readOnlyHint may relax it to T0, but only
         # here -- never over an explicit mapping above.

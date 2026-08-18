@@ -1,13 +1,7 @@
-"""Scenario bank: load, validate, seed.
-
-validate() needs no API key, so a typo'd assertion type is caught offline rather
-than silently passing. Scenarios carry their own facts, seeded into a scratch
-copy of the db, so grading is identical on every machine.
-"""
+"""Scenario bank: load, validate, seed."""
 
 from __future__ import annotations
 
-import contextlib
 import shutil
 import sqlite3
 import time
@@ -15,13 +9,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import sqlite_vec
 import yaml
 
 from mehullm.eval.graders import known_assertions
 
+# _embed_text is imported rather than reimplemented on purpose: a seeded fact
+# embedded differently from a real one is not exercising the real retriever.
+from mehullm.memory.embed import embed_passages
+from mehullm.memory.facts import _embed_text
+from mehullm.memory.store import pack
+
 CATEGORIES = {
-    "style", "factual_recall", "tool_selection", "refusal",
-    "multistep", "hallucination_trap", "prompt_injection",
+    "style",
+    "factual_recall",
+    "tool_selection",
+    "refusal",
+    "multistep",
+    "hallucination_trap",
+    "prompt_injection",
 }
 
 
@@ -60,10 +66,12 @@ def load(path: str | Path) -> list[Scenario]:
         doc = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
         for raw in doc.get("scenarios", []):
             known = Scenario.__dataclass_fields__
-            out.append(Scenario(
-                **{k: v for k, v in raw.items() if k in known},
-                source=str(f),
-            ))
+            out.append(
+                Scenario(
+                    **{k: v for k, v in raw.items() if k in known},
+                    source=str(f),
+                )
+            )
     return out
 
 
@@ -117,7 +125,7 @@ def coverage(scenarios: list[Scenario]) -> dict[str, int]:
     return out
 
 
-# ------------------------------------------------------------------ seeding
+# ------------------------------------------------------------------ seeding.
 
 _SEED_SQL = """
 INSERT OR REPLACE INTO facts
@@ -127,38 +135,69 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 
-def seed_db(base_db: str | Path, scratch: str | Path,
-            scenario: Scenario) -> Path:
-    """Copy the db and overwrite facts with the scenario's own. A copy, so an
-    eval can never mutate real facts. Style chunks are kept."""
+def seed_db(base_db: str | Path, scratch: str | Path, scenario: Scenario) -> Path:
+    """Copy the db and replace facts with the scenario's own."""
     scratch = Path(scratch)
     scratch.parent.mkdir(parents=True, exist_ok=True)
     if scratch.exists():
-        scratch.unlink()
+        try:
+            scratch.unlink()
+        except OSError:
+            # Windows refuses to delete an open file, and the per-scenario.
+            for n in range(1, 50):
+                alt = scratch.with_name(f"{scratch.stem}.{n}{scratch.suffix}")
+                if not alt.exists():
+                    scratch = alt
+                    break
+            else:
+                raise
     shutil.copy2(base_db, scratch)
 
     con = sqlite3.connect(scratch)
     try:
+        con.enable_load_extension(True)
+        sqlite_vec.load(con)
+        con.enable_load_extension(False)
+
         con.execute("DELETE FROM facts")
-        for tbl in ("facts_vec", "facts_fts"):
-            # vec0 needs the extension loaded; absence is not fatal here
-            with contextlib.suppress(sqlite3.OperationalError):
-                con.execute(f"DELETE FROM {tbl}")
+        con.execute("DELETE FROM facts_vec")
 
         now = int(time.time())
+        rows = []
         for f in scenario.seed_facts:
             fid = int(str(f["id"]).lstrip("F"))
             sup = f.get("superseded_by")
-            con.execute(_SEED_SQL, (
-                fid, f.get("subject", ""), f.get("predicate", ""),
-                f.get("object", ""), f["text"], int(f.get("single_valued", 0)),
-                float(f.get("confidence", 0.9)), f.get("observed_at", now),
-                "[]", int(str(sup).lstrip("F")) if sup else None,
-                # Seeded facts are 'active' by default: a scenario asserting
-                # recall needs them retrievable, and the pending/review flow is
-                # the extraction pipeline's concern, not the bank's.
-                f.get("status", "active"), "seeded by eval scenario", 1,
-            ))
+            con.execute(
+                _SEED_SQL,
+                (
+                    fid,
+                    f.get("subject", ""),
+                    f.get("predicate", ""),
+                    f.get("object", ""),
+                    f["text"],
+                    int(f.get("single_valued", 0)),
+                    float(f.get("confidence", 0.9)),
+                    f.get("observed_at", now),
+                    "[]",
+                    int(str(sup).lstrip("F")) if sup else None,
+                    # Seeded facts are 'active' by default: a scenario asserting.
+                    f.get("status", "active"),
+                    "seeded by eval scenario",
+                    1,
+                ),
+            )
+            rows.append((fid, f))
+
+        # Predicate-prefixed, matching memory.facts._embed_text -- a seeded fact
+        # embedded differently from a real one is not testing the real retriever.
+        if rows:
+            texts = [_embed_text(f) for _, f in rows]
+            for (fid, _), vec in zip(rows, embed_passages(texts), strict=True):
+                con.execute(
+                    "INSERT INTO facts_vec(fact_id, embedding) VALUES (?,?)", (fid, pack(vec))
+                )
+
+        con.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
         con.commit()
     finally:
         con.close()

@@ -1,19 +1,17 @@
-"""Memory CLI.
-
-    uv run mehullm-memory load                      # facts/*.yaml -> memory
-    uv run mehullm-memory search "where do I live"
-    uv run mehullm-memory stats
-"""
+"""Memory CLI."""
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from mehullm.memory.retrieve import render_memory_block, search_facts, search_style
 from mehullm.memory.store import MemoryStore
+from mehullm.obs import utf8_stdout
+from mehullm.settings import settings
 
-DEFAULT_DB = "data/derived/memory.db"
+DEFAULT_DB = settings.memory_db
 
 
 def _cmd_load(a: argparse.Namespace) -> int:
@@ -44,7 +42,27 @@ def _cmd_stats(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_index(a: argparse.Namespace) -> int:
+    """Index chat exports as style exemplars."""
+    import json
+
+    from mehullm.memory.index_chats import index
+
+    aliases = set(a.self_alias or [])
+    if a.contacts and Path(a.contacts).exists():
+        tagged = json.loads(Path(a.contacts).read_text(encoding="utf-8"))
+        aliases |= {k for k, v in tagged.items() if v == "self"}
+    if not aliases:
+        print("no self aliases: pass --self-alias or a --contacts file", file=sys.stderr)
+        return 1
+    st = index(a.raw_dir, a.db, aliases, on_progress=lambda n, f: print(f"  {n:>6} {f}"))
+    for k, v in vars(st).items():
+        print(f"  {k:<20} {v}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    utf8_stdout()
     p = argparse.ArgumentParser(prog="mehullm-memory")
     p.add_argument("--db", default=DEFAULT_DB)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -58,6 +76,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-k", type=int, default=8)
     s.add_argument("--style", action="store_true")
     s.set_defaults(fn=_cmd_search)
+
+    ix = sub.add_parser("index", help="index chat exports as style exemplars")
+    ix.add_argument("--raw-dir", default=str(Path(settings.mehullm_derived_dir).parent / "raw"))
+    ix.add_argument("--self-alias", action="append", help="repeatable")
+    ix.add_argument("--contacts", default=str(Path(settings.mehullm_derived_dir) / "contacts.json"))
+    ix.set_defaults(fn=_cmd_index)
 
     st = sub.add_parser("stats", help="counts")
     st.set_defaults(fn=_cmd_stats)

@@ -1,29 +1,4 @@
-"""Build the supervised fine-tuning dataset from parsed WhatsApp exports.
-
-Pipeline order, and the order matters:
-
-    parse -> turns -> sessions -> pairs
-          -> scrub PII + pseudonymise names      (before any model sees it)
-          -> drop invalid targets
-          -> cap exact duplicates
-          -> length-bucket rebalancing
-          -> split BY CHAT (never by message)
-          -> pairs.jsonl
-
-Output is an *intermediate* format: (context -> my reply). The rewriter's input
-side -- the neutral draft -- is added later by `neutralize.py`, which runs a
-local model over these pairs. Keeping the two steps separate means the slow,
-overnight generation step can be re-run without re-deriving the corpus, and the
-expensive step is cached by content hash.
-
-Two decisions that would otherwise ruin the fine-tune:
-
-1. Short replies ("ok", "hmm", "haan") are ~35% of the corpus. Dropped, the
-   model writes essays; kept whole, it collapses to one word. So: downsampled.
-2. Split BY CHAT FILE, never by message -- two turns from one conversation
-   split across train/val leak context. Two chats are held out untouched for
-   style scoring.
-"""
+"""Build the supervised fine-tuning dataset from parsed WhatsApp exports."""
 
 from __future__ import annotations
 
@@ -132,11 +107,7 @@ def _scrub_pair(pair: Pair, names: NameMap, all_names: list[str], stats: BuildSt
 
 
 def _cap_duplicates(records: list[Record], stats: BuildStats) -> list[Record]:
-    """Stop any one exact reply from dominating.
-
-    Without this, "ok" alone can be ~9% of the dataset and the model learns
-    that "ok" is a globally acceptable answer to anything.
-    """
+    """Stop any one exact reply from dominating."""
     limit = max(1, int(len(records) * MAX_DUPLICATE_SHARE))
     seen: Counter[str] = Counter()
     kept: list[Record] = []
@@ -151,18 +122,7 @@ def _cap_duplicates(records: list[Record], stats: BuildStats) -> list[Record]:
 
 
 def _rebalance_buckets(records: list[Record], rng: random.Random, stats: BuildStats):
-    """Downsample the short-reply buckets to their configured share of the final set.
-
-    Solved by WATER-FILLING, not a single division. The naive form --
-    ``total = uncapped / (1 - sum_of_caps)`` -- silently overshoots whenever a
-    capped bucket is empty or holds fewer records than its cap allows, because
-    it assumes every capped bucket fills. With only the "1-2" bucket populated
-    it produced 18.4% against a 15% cap.
-
-    So: assume every capped bucket is binding, solve for the total, then demote
-    any bucket that turns out to hold less than its allowance to "takes
-    everything" and re-solve. Converges in at most len(BUCKET_CAPS) rounds.
-    """
+    """Downsample the short-reply buckets to their configured share of the final set."""
     by_bucket: dict[str, list[Record]] = defaultdict(list)
     for r in records:
         by_bucket[r.bucket].append(r)
@@ -208,12 +168,7 @@ def _rebalance_buckets(records: list[Record], rng: random.Random, stats: BuildSt
 def _assign_splits(
     records: list[Record], chat_ids: list[str], rng: random.Random, stats: BuildStats
 ) -> None:
-    """Split BY CHAT. Two whole chats are withheld for style scoring.
-
-    Held-out chats are chosen from the mid-sized ones: withholding the largest
-    would throw away a big share of training data, and withholding the tiniest
-    gives a style estimate too noisy to trust.
-    """
+    """Split BY CHAT."""
     counts = Counter(r.chat_id for r in records)
     ranked = [c for c, _ in counts.most_common()]
     mid = ranked[1:-1] or ranked  # skip the biggest and smallest when possible
@@ -222,11 +177,7 @@ def _assign_splits(
     remaining = [c for c in ranked if c not in heldout]
     val_target = sum(counts[c] for c in remaining) * VAL_SHARE
 
-    # Whole chats are indivisible, so an exact 15% is usually unreachable. A
-    # naive "keep adding until we cross the target" overshoots badly when a
-    # few chats dominate -- it produced a 30.4% validation split on the real
-    # corpus. Instead, walk smallest-first and take a chat only if doing so
-    # moves the total CLOSER to the target than leaving it out.
+    # Whole chats are indivisible, so an exact 15% is usually unreachable. A.
     val, acc = set(), 0
     for c in sorted(remaining, key=lambda c: counts[c]):
         if abs(acc + counts[c] - val_target) < abs(acc - val_target):
@@ -262,11 +213,7 @@ def build(
 
     records: list[Record] = []
     for chat in chats:
-        # GROUP CHATS ARE EXCLUDED AS SFT TARGETS. Group voice differs from 1:1
-        # voice, and other participants' turns contaminate the context with
-        # names and in-jokes the model would learn to imitate. Groups still
-        # feed the style-exemplar index and fact extraction later -- just not
-        # the supervised targets.
+        # GROUP CHATS ARE EXCLUDED AS SFT TARGETS. Group voice differs from 1:1.
         if len(chat.participants) > 2:
             stats.skipped_group_chats.append(chat.chat_id)
             continue

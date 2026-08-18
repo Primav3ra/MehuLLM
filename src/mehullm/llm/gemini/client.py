@@ -1,22 +1,10 @@
-"""Gemini adapter (primary brain).
-
-Uses `generate_content_stream`, NOT the Interactions API. Interactions is
-Google's recommended agentic surface, but every one of its selling points is
-hostile to this design:
-
-  * server-side state (`previous_interaction_id`) cannot transfer to Groq on
-    failover -- and failover is the router's entire reason to exist;
-  * managed tool orchestration would bypass the guardrail interceptor, which
-    must gate every single tool call;
-  * `store=true` is the default and persists conversations on Google's servers,
-    against the project's privacy posture.
-
-Kept under ~250 lines behind the LLMClient protocol so it stays swappable if
-that calculus changes.
-"""
+"""Gemini adapter."""
 
 from __future__ import annotations
 
+import contextlib
+import json
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -37,19 +25,47 @@ from mehullm.llm.types import (
 DEFAULT_MODEL = "gemini-3.5-flash"
 
 
+def _quota_details(exc: Exception) -> tuple[str, float | None, int | None]:
+    """(window, retry_after_s, limit) from a 429 body. window is "day"|"minute"|""."""
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return "", None, None
+    window, retry, limit = "", None, None
+    for d in (details.get("error") or {}).get("details") or []:
+        kind = str(d.get("@type", ""))
+        if kind.endswith("QuotaFailure"):
+            for v in d.get("violations") or []:
+                qid = str(v.get("quotaId", ""))
+                if "PerDay" in qid:
+                    window = "day"
+                elif "PerMinute" in qid and window != "day":
+                    window = "minute"
+                with contextlib.suppress(TypeError, ValueError):
+                    limit = int(v.get("quotaValue"))
+        elif kind.endswith("RetryInfo"):
+            raw = str(d.get("retryDelay", "")).rstrip("s")
+            with contextlib.suppress(ValueError):
+                retry = float(raw)
+    return window, retry, limit
+
+
 def _classify(exc: Exception) -> ProviderError:
     s = f"{type(exc).__name__}: {exc}".lower()
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if code == 429 or "429" in s or "resource_exhausted" in s or "rate limit" in s:
-        return ProviderError("rate_limit", str(exc), provider="gemini")
-    if "quota" in s or "exceeded your current quota" in s:
-        return ProviderError("quota", str(exc), provider="gemini")
+
+    if code == 429 or "resource_exhausted" in s:
+        # A 429 is BOTH windows. Google says which in quotaId; the string does
+        # not, and it always contains the word "quota" either way.
+        window, retry, limit = _quota_details(exc)
+        kind = "quota" if window == "day" else "rate_limit"
+        return ProviderError(kind, str(exc), provider="gemini", retry_after=retry, limit=limit)
     if code in (500, 502, 503, 504) or "unavailable" in s or "overloaded" in s:
         return ProviderError("overloaded", str(exc), provider="gemini")
     if "deadline" in s or "timeout" in s:
         return ProviderError("timeout", str(exc), provider="gemini")
+    if code == 404 or "no longer available" in s or "not_found" in s:
+        return ProviderError("model_unavailable", str(exc), provider="gemini")
     if code == 400 or "invalid" in s:
-        # Never fails over -- this is a sanitiser bug and must surface.
         return ProviderError("bad_request", str(exc), provider="gemini")
     if code in (401, 403) or "api key" in s or "permission" in s:
         return ProviderError("auth", str(exc), provider="gemini")
@@ -57,22 +73,21 @@ def _classify(exc: Exception) -> ProviderError:
 
 
 class GeminiClient:
-    name = "gemini"
-
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         from google import genai  # imported lazily: optional dep
+
+        # Per-instance and model-qualified: quota is per-model, and the router
+        # keys every lookup and demotion on client.name.
+        self.name = f"gemini:{model}"
 
         self._genai = genai
         self._client = genai.Client(api_key=api_key)
         self.model = model
         self._turn = 0
-        # Gemini 3.x returns an encrypted `thought_signature` on every
-        # functionCall part and REJECTS the next request with 400 if it is not
-        # echoed back. It is provider-opaque and meaningless to Groq, so it is
-        # cached here, keyed by the synthetic call id, and never enters
-        # canonical history -- a failover simply drops it.
-        self._sigs: dict[str, Any] = {}
-
+        self._cid = uuid.uuid4().hex[:6]
+        # Raw functionCall Parts keyed by call id. Gemini 400s if a signature is
+        # not echoed back, and rebuilding a Part loses it.
+        self._parts: dict[str, Any] = {}
 
     def _to_contents(self, messages: list[Msg]) -> list[Any]:
         from google.genai import types
@@ -98,11 +113,17 @@ class GeminiClient:
             parts = []
             if m.text:
                 parts.append(types.Part.from_text(text=m.text))
+            unsigned = []
             for tc in m.tool_calls:
-                fp = types.Part.from_function_call(name=tc.name, args=tc.args)
-                if sig := self._sigs.get(tc.id):
-                    fp.thought_signature = sig
-                parts.append(fp)
+                if (raw := self._parts.get(tc.id)) is not None:
+                    parts.append(raw)
+                else:
+                    # Foreign or restored call: an unsigned Part is a guaranteed 400.
+                    unsigned.append(f"{tc.name}({json.dumps(tc.args, default=str)})")
+            if unsigned:
+                parts.append(
+                    types.Part.from_text(text="[previously called: " + "; ".join(unsigned) + "]")
+                )
             if not parts:
                 continue
             out.append(
@@ -123,7 +144,6 @@ class GeminiClient:
                 kwargs["parameters"] = sanitize(t.parameters)
             decls.append(types.FunctionDeclaration(**kwargs))
         return [types.Tool(function_declarations=decls)]
-
 
     async def stream(
         self,
@@ -160,13 +180,11 @@ class GeminiClient:
                             yield TextDelta(text)
                         fc = getattr(part, "function_call", None)
                         if fc:
-                            # Gemini gives no call id. Synthesise one NOW so the
-                            # canonical history always has it -- without this a
-                            # mid-conversation failover to Groq cannot build a
-                            # legal tool message and the result degrades to text.
-                            call_id = f"call_{self._turn}_{idx}"
-                            if sig := getattr(part, "thought_signature", None):
-                                self._sigs[call_id] = sig
+                            # Synthesised at ingest: canonical history always has an id.
+                            call_id = f"call_{self._cid}_{self._turn}_{idx}"
+                            # Keep the WHOLE part, signature included, whether or
+                            # not one is visible on it. See _parts in __init__.
+                            self._parts[call_id] = part
                             yield ToolCallReady(
                                 ToolCall(
                                     id=call_id,
@@ -189,7 +207,7 @@ class GeminiClient:
                         self.name,
                         self.model,
                     )
-        except Exception as e:  # noqa: BLE001 -- normalised into ProviderError
+        except Exception as e:
             raise _classify(e) from e
 
         yield StreamEnd("tool_use" if idx else finish)

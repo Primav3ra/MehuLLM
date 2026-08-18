@@ -1,26 +1,12 @@
-"""The orchestration loop.
-
-Hand-rolled deliberately. The confirmation gate must suspend mid-flight and
-resume from a different HTTP request minutes later, which needs the run to be a
-durable object rather than a callback -- and the loop is the artifact this
-project is actually about.
-
-Correctness rules baked in below:
-
-* ALL tool results go back in ONE turn. Splitting them across turns trains the
-  model to stop making parallel calls (true on both providers).
-* EVERY tool call gets a matching result, including denied and errored ones.
-  A missing result is a 400.
-* Hard step cap. A runaway loop burns a free-tier daily quota in ninety seconds.
-* Only the FINAL turn is voiced. Voicing in-loop narration would double latency
-  on every step for no benefit.
-"""
+"""The orchestration loop."""
 
 from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from dataclasses import dataclass
+from typing import Any
 
 from mehullm.agent import events as ev
 from mehullm.agent.prompt import system_prompt, wrap_untrusted
@@ -38,6 +24,10 @@ from mehullm.llm.types import (
     UsageEvent,
 )
 from mehullm.mcp.registry import Registry
+from mehullm.obs import bind_run, get_logger
+from mehullm.persistence import tracing
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -68,6 +58,14 @@ class AgentLoop:
         self.cfg = config or LoopConfig()
 
     async def run_turn(self, run: Run, user_message: str, memory_facts: str = "") -> None:
+        tracing.bind_trace(run.trace_id)
+        bind_run(trace_id=run.trace_id, run_id=run.id)
+        with tracing.span("turn", "turn") as turn_span:
+            await self._run_turn(run, user_message, memory_facts, turn_span)
+
+    async def _run_turn(
+        self, run: Run, user_message: str, memory_facts: str, turn_span: Any
+    ) -> None:
         started = time.monotonic()
         tools = self.registry.tool_defs()
         system = system_prompt(memory_facts)
@@ -80,18 +78,35 @@ class AgentLoop:
         run.history.append(Msg(role="user", text=redacted))
 
         provider = self.router.pick()
+        turn_span.attrs.update(
+            tools=len(tools),
+            servers=sorted({d.name.split("__")[0] for d in tools}),
+            schema_tokens=self.registry.estimated_schema_tokens(),
+            voice=type(self.voice).__name__ if self.voice else None,
+        )
+        turn_span.input_text = user_message
+        log.info(
+            "turn.start",
+            tools=len(tools),
+            servers=sorted({d.name.split("__")[0] for d in tools}),
+            provider=provider.client.name,
+            voice=bool(self.voice),
+        )
         await run.emit(
-            ev.run_start(run.conversation_id, provider.client.name,
-                         provider.client.model, len(tools))
+            ev.run_start(
+                run.conversation_id, provider.client.name, provider.client.model, len(tools)
+            )
         )
 
         try:
             for step in range(1, self.cfg.max_steps + 1):
                 self.killswitch.check()
                 if time.monotonic() - started > self.cfg.max_turn_seconds:
-                    await run.emit(ev.guardrail_blocked(
-                        "wall-clock", "policy",
-                        f"turn exceeded {self.cfg.max_turn_seconds}s"))
+                    await run.emit(
+                        ev.guardrail_blocked(
+                            "wall-clock", "policy", f"turn exceeded {self.cfg.max_turn_seconds}s"
+                        )
+                    )
                     break
 
                 await run.emit(ev.status("thinking"))
@@ -110,14 +125,14 @@ class AgentLoop:
                     elif isinstance(event, ToolCallReady):
                         calls.append(event.call)
                     elif isinstance(event, UsageEvent):
-                        await run.emit(ev.usage(
-                            event.usage.input_tokens, event.usage.output_tokens, step))
+                        await run.emit(
+                            ev.usage(event.usage.input_tokens, event.usage.output_tokens, step)
+                        )
                     elif isinstance(event, StreamEnd):
                         break
 
                 for sw in self.router.drain_switches():
-                    await run.emit(ev.provider_switch(
-                        sw.from_provider, sw.to_provider, sw.reason))
+                    await run.emit(ev.provider_switch(sw.from_provider, sw.to_provider, sw.reason))
 
                 assistant_text = "".join(text_parts)
                 run.history.append(
@@ -130,18 +145,20 @@ class AgentLoop:
 
                 tool_calls_total += len(calls)
                 if tool_calls_total > self.cfg.max_tool_calls_per_turn:
-                    await run.emit(ev.guardrail_blocked(
-                        "tool-budget", "policy",
-                        f"exceeded {self.cfg.max_tool_calls_per_turn} tool calls this turn"))
+                    await run.emit(
+                        ev.guardrail_blocked(
+                            "tool-budget",
+                            "policy",
+                            f"exceeded {self.cfg.max_tool_calls_per_turn} tool calls this turn",
+                        )
+                    )
                     break
 
                 await run.emit(ev.status("calling_tools", f"{len(calls)} call(s)"))
 
                 # Parallel across calls. Confirmations therefore arrive as a
                 # STACK of cards, not a modal -- the UI must handle that.
-                outcomes = await asyncio.gather(
-                    *(self.interceptor.execute(run, c) for c in calls)
-                )
+                outcomes = await asyncio.gather(*(self.interceptor.execute(run, c) for c in calls))
                 # Every call gets a result, in ONE batch, in call order.
                 for out in outcomes:
                     run.history.append(
@@ -154,8 +171,11 @@ class AgentLoop:
                         )
                     )
             else:
-                await run.emit(ev.guardrail_blocked(
-                    "step-cap", "policy", f"hit the {self.cfg.max_steps}-step limit"))
+                await run.emit(
+                    ev.guardrail_blocked(
+                        "step-cap", "policy", f"hit the {self.cfg.max_steps}-step limit"
+                    )
+                )
 
             final_text = await self._voice(run, final_text)
             run.status = "ok"
@@ -168,9 +188,13 @@ class AgentLoop:
             run.status = "cancelled"
             raise
         except ProviderError as e:
+            run.error = f"{e.kind}: {e}"
+            log.warning("turn.provider_error", kind=e.kind, error=str(e))
             await run.emit(ev.error(e.kind, str(e), retriable=e.should_failover))
             run.status = "error"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
+            run.error = traceback.format_exc()[-2000:]
+            log.error("turn.failed", error=str(e), exc_info=True)
             await run.emit(ev.error("internal", f"{type(e).__name__}: {e}"))
             run.status = "error"
         finally:
@@ -178,32 +202,55 @@ class AgentLoop:
             run.finished = True
             # done is ALWAYS last and ALWAYS exactly one -- the client has a
             # single teardown path.
-            await run.emit(ev.done(
-                run.status, final_text, step, tool_calls_total,
-                int((time.monotonic() - started) * 1000),
-            ))
+            await run.emit(
+                ev.done(
+                    run.status,
+                    final_text,
+                    step,
+                    tool_calls_total,
+                    int((time.monotonic() - started) * 1000),
+                )
+            )
 
     async def _voice(self, run: Run, draft: str) -> str:
         """Voice only the final turn, and never let it change facts."""
         if not draft:
             return draft
-        if not self.cfg.voice_enabled or self.voice is None or len(draft) < 40:
-            # Still emitted as voice_delta so the client keeps one render path.
+
+        skip = (
+            "disabled"
+            if not self.cfg.voice_enabled
+            else "no_model"
+            if self.voice is None
+            else "too_short"
+            if len(draft) < 40
+            else None
+        )
+        if skip:
+            with tracing.span("voice", "voice_rewrite", skipped=skip) as sp:
+                sp.status = "skipped"
+            log.info("voice.skip", reason=skip, chars=len(draft))
             await run.emit(ev.voice_delta(draft))
             return draft
 
         started = time.monotonic()
         await run.emit(ev.voice_start(getattr(self.voice, "model", "voice")))
-        try:
-            voiced, ok = await self.voice.rewrite(draft)
-        except Exception:  # noqa: BLE001 -- voice is best-effort, never fatal
-            await run.emit(ev.voice_delta(draft))
-            await run.emit(ev.voice_end(True, True, int((time.monotonic() - started) * 1000)))
-            return draft
+        with tracing.span("voice", "voice_rewrite") as sp:
+            sp.model = getattr(self.voice, "model", "")
+            sp.input_text = draft
+            try:
+                voiced, ok = await self.voice.rewrite(draft)
+            except Exception as e:
+                sp.status, sp.error = "error", f"{type(e).__name__}: {e}"
+                log.warning("voice.failed", error=str(e), exc_info=True)
+                await run.emit(ev.voice_delta(draft))
+                # invariants_ok=False: nothing ran, so nothing was preserved.
+                await run.emit(ev.voice_end(False, True, int((time.monotonic() - started) * 1000)))
+                return draft
+            sp.output_text = voiced
+            sp.attrs["invariants_ok"] = ok
 
         text = voiced if ok else draft
         await run.emit(ev.voice_delta(text))
-        await run.emit(
-            ev.voice_end(ok, not ok, int((time.monotonic() - started) * 1000))
-        )
+        await run.emit(ev.voice_end(ok, not ok, int((time.monotonic() - started) * 1000)))
         return text

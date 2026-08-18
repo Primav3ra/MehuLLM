@@ -1,16 +1,4 @@
-"""FastAPI backend.
-
-Single-user software: one static bearer token, no login system.
-
-The SSE contract is the important surface here. Two things it must get right:
-
-* KEEP-ALIVES. A pending confirmation means zero bytes for up to 120 s.
-  Without `ping=`, the stream dies at ~30 s behind any proxy and you will spend
-  a day blaming CORS.
-* THE RUN OUTLIVES THE REQUEST. /chat returns a stream that is merely a
-  subscriber; the loop keeps running if the browser goes away, and
-  /chat/{id}/events?after_seq=N replays whatever was missed.
-"""
+"""FastAPI backend."""
 
 from __future__ import annotations
 
@@ -21,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -32,12 +19,15 @@ from mehullm.agent.run_manager import Decision, RunManager
 from mehullm.guardrails.interceptor import Interceptor
 from mehullm.guardrails.killswitch import KillSwitch, RateLimiter
 from mehullm.guardrails.policy import Policy
-from mehullm.llm.quota import Limits, QuotaStore
-from mehullm.llm.router import LLMRouter, Provider
-from mehullm.mcp.hub import MCPHub, ServerSpec
+from mehullm.llm.providers import build_providers
+from mehullm.llm.quota import QuotaStore
+from mehullm.llm.router import LLMRouter
+from mehullm.mcp.hub import MCPHub, load_server_specs
 from mehullm.mcp.registry import Registry
 from mehullm.memory.conversation import ConversationStore
 from mehullm.memory.retrieve import render_memory_block, search_facts
+from mehullm.obs import bind_run, configure_logging, redacted_len
+from mehullm.persistence import tracing
 from mehullm.persistence.tracing import TraceStore
 from mehullm.settings import settings
 from mehullm.voice.rewrite import VoiceRewriter
@@ -65,76 +55,52 @@ def auth(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "bad token")
 
 
-def _load_specs(path: str) -> list[ServerSpec]:
-    p = Path(path)
-    if not p.exists():
-        return []
-    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    out = []
-    for s in raw.get("servers", []):
-        allow = (s.get("tools") or {}).get("allow")
-        out.append(
-            ServerSpec(
-                id=s["id"],
-                transport=s.get("transport", "stdio"),
-                command=s.get("command"),
-                args=list(s.get("args") or []),
-                env=dict(s.get("env") or {}),
-                cwd=s.get("cwd"),
-                url=s.get("url"),
-                headers=dict(s.get("headers") or {}),
-                allow=set(allow) if allow else None,
-                timeout_s=float(s.get("timeout_s", 30)),
-                lazy=bool(s.get("lazy", False)),
-                idle_kill_s=float(s.get("idle_kill_s", 600)),
-            )
-        )
-    return out
-
-
 def _voice_if_available() -> VoiceRewriter | None:
-    from mehullm.voice.client import OllamaClient
+    from mehullm.voice.rewrite import voice_if_available
 
-    try:
-        if OllamaClient(model=settings.ollama_voice_model,
-                        host=settings.ollama_host).has_model():
-            return VoiceRewriter(host=settings.ollama_host,
-                                 model=settings.ollama_voice_model)
-        log.info("voice model not installed; serving brain output unstyled",
-                 model=settings.ollama_voice_model)
-    except Exception as e:  # noqa: BLE001 -- ollama being down is not fatal
-        log.info("ollama unreachable; voice disabled", error=str(e))
-    return None
+    rewriter = voice_if_available(settings.ollama_host, settings.ollama_voice_model)
+    if rewriter is None:
+        log.info(
+            "voice unavailable; serving brain output unstyled", model=settings.ollama_voice_model
+        )
+    return rewriter
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    configure_logging(settings.log_level, settings.log_file)
     registry = Registry()
-    hub = MCPHub(_load_specs(settings.servers_config), registry)
-    STATE["mcp_report"] = await hub.start()
+    specs = load_server_specs(settings.servers_config)
+    for s in specs:
+        log.info(
+            "server.config",
+            server=s.id,
+            transport=s.transport,
+            secrets={k: redacted_len(v) for k, v in s.expanded_env().items()},
+            unresolved=s.unresolved() or None,
+        )
+    hub = MCPHub(specs, registry)
+    report = await hub.register_all()
+    STATE["mcp_report"] = report
+    STATE["reaper"] = asyncio.create_task(hub.reaper())
+    log.info("mcp.ready", **report)
+    log.info(
+        "tools.registered",
+        n=len(registry),
+        by_server={
+            sid: sorted(
+                d.name.split("__", 1)[1]
+                for d in registry.tool_defs()
+                if d.name.startswith(f"{sid}__")
+            )
+            for sid in sorted({d.name.split("__")[0] for d in registry.tool_defs()})
+        },
+        schema_tokens=registry.estimated_schema_tokens(),
+    )
 
     quota = QuotaStore(settings.mehullm_db)
-    providers: list[Provider] = []
-    if settings.gemini_api_key:
-        from mehullm.llm.gemini.client import GeminiClient
-
-        providers.append(
-            Provider(
-                GeminiClient(settings.gemini_api_key, settings.gemini_model),
-                Limits(settings.gemini_rpm_guess, settings.gemini_rpd_guess),
-                priority=0,
-            )
-        )
-    if settings.groq_api_key:
-        from mehullm.llm.groq.client import GroqClient
-
-        providers.append(
-            Provider(
-                GroqClient(settings.groq_api_key, settings.groq_model),
-                Limits(30, 1000),
-                priority=1,
-            )
-        )
+    providers = build_providers()
+    log.info("provider ladder", providers=[p.client.name for p in providers])
 
     # Local tools must be registered BEFORE the loop is built, or the model is
     # never told memory_search/remember/now exist.
@@ -145,13 +111,12 @@ async def startup() -> None:
     local_tools = local_tools_mod.register(registry, memory)
     convos = ConversationStore(memory)
     traces = TraceStore(settings.mehullm_db)
+    tracing.set_store(traces)
 
     ks = KillSwitch(settings.mehullm_db)
     ks.load()
     policy = (
-        Policy.load(settings.policy_config)
-        if Path(settings.policy_config).exists()
-        else Policy()
+        Policy.load(settings.policy_config) if Path(settings.policy_config).exists() else Policy()
     )
 
     STATE.update(
@@ -172,8 +137,12 @@ async def startup() -> None:
             router=STATE["router"],
             registry=registry,
             interceptor=Interceptor(
-                registry=registry, hub=hub, policy=policy, killswitch=ks,
-                limiter=RateLimiter(), local_tools=local_tools,
+                registry=registry,
+                hub=hub,
+                policy=policy,
+                killswitch=ks,
+                limiter=RateLimiter(),
+                local_tools=local_tools,
                 confirm_timeout_s=settings.mehullm_confirm_timeout_s,
             ),
             killswitch=ks,
@@ -208,7 +177,11 @@ class ConfirmRequest(BaseModel):
 
 async def _stream(run, after_seq: int = 0) -> AsyncIterator[dict]:
     async for event in run.subscribe(after_seq):
-        yield {"id": str(event.seq), "event": event.type, "data": event.to_sse().split("data: ", 1)[1].rstrip("\n")}
+        yield {
+            "id": str(event.seq),
+            "event": event.type,
+            "data": event.to_sse().split("data: ", 1)[1].rstrip("\n"),
+        }
 
 
 @app.post("/api/chat", dependencies=[Depends(auth)])
@@ -218,13 +191,17 @@ async def chat(req: ChatRequest):
         raise HTTPException(503, "No LLM provider configured. Set GEMINI_API_KEY in .env")
     runs: RunManager = STATE["runs"]
     run = runs.create(req.conversation_id)
+    tracing.bind_trace(run.trace_id)
+    bind_run(trace_id=run.trace_id, run_id=run.id)
 
     # Retrieve BEFORE the turn starts: the facts go into the system prompt, so
     # they have to be resolved up front rather than fetched mid-stream.
     memory_block = ""
     if (memory := STATE.get("memory")) is not None:
         try:
-            hits = search_facts(memory, req.message, k=settings.memory_facts_k)
+            with tracing.span("memory", "retrieval", k=settings.memory_facts_k) as sp:
+                hits = search_facts(memory, req.message, k=settings.memory_facts_k)
+                sp.attrs["hits"] = [h.id for h in hits]
             memory_block = render_memory_block(hits) if hits else ""
         except Exception as e:  # memory is an enhancement, never a hard dependency
             log.warning("memory retrieval failed", error=str(e))
@@ -244,21 +221,20 @@ async def chat(req: ChatRequest):
         finally:
             if traces is not None:
                 traces.end_trace(
-                    run.trace_id, status=run.status, final_output=run.final_text
+                    run.trace_id,
+                    status=run.status,
+                    final_output=run.final_text,
+                    error=run.error,
                 )
             # Persisted even on error: a failed turn the user can still see is
             # better than a hole in the conversation.
             if convos is not None:
                 convos.append(req.conversation_id, "user", req.message, run.trace_id)
-                convos.append(
-                    req.conversation_id, "assistant", run.final_text, run.trace_id
-                )
+                convos.append(req.conversation_id, "assistant", run.final_text, run.trace_id)
 
     # The loop is owned by the RUN, not by this request.
     run.task = asyncio.create_task(_turn_and_persist())
-    return EventSourceResponse(
-        _stream(run), ping=15, headers={"X-Trace-Id": run.trace_id}
-    )
+    return EventSourceResponse(_stream(run), ping=15, headers={"X-Trace-Id": run.trace_id})
 
 
 @app.get("/api/chat/{run_id}/events", dependencies=[Depends(auth)])
@@ -322,8 +298,7 @@ async def conversation(conversation_id: str, limit: int = 100):
     convos: ConversationStore | None = STATE.get("convos")
     if convos is None:
         raise HTTPException(503, "conversation store unavailable")
-    return {"conversation_id": conversation_id,
-            "turns": convos.recent(conversation_id, limit)}
+    return {"conversation_id": conversation_id, "turns": convos.recent(conversation_id, limit)}
 
 
 @app.get("/api/tools", dependencies=[Depends(auth)])
@@ -391,9 +366,7 @@ async def status():
 async def health():
     import shutil
 
-    # The import lives inside the guard on purpose: health is what you call
-    # when something is already wrong, so a missing optional dep must degrade
-    # to `null`, never 500.
+    # The import lives inside the guard on purpose: health is what you call.
     free_ram = None
     with contextlib.suppress(Exception):
         import psutil  # type: ignore[import-not-found]

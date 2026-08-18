@@ -1,9 +1,4 @@
-"""Minimal Ollama client -- plain httpx, two endpoints, no `ollama` package.
-
-Qwen3 is hybrid-thinking and emits `<think>` blocks that would otherwise leak
-into training data and replies. `strip_thinking()` removes them; `no_think=True`
-suppresses them at the source.
-"""
+"""Minimal Ollama client -- plain httpx, two endpoints, no `ollama` package."""
 
 from __future__ import annotations
 
@@ -77,7 +72,6 @@ class OllamaClient:
         if not self.has_model():
             raise OllamaError(f"Model {self.model!r} not installed. Run: ollama pull {self.model}")
 
-
     def generate(
         self,
         prompt: str,
@@ -124,8 +118,7 @@ class OllamaClient:
         fmt: dict | str | None = None,
         client: httpx.Client | None = None,
     ) -> str:
-        """Use this, not `generate`, for few-shot: on the completion endpoint a
-        small model continues the examples instead of answering."""
+        """Use this, not `generate`, for few-shot: on the completion endpoint a small model continues the examples instea."""
         payload: dict = {
             "model": self.model,
             "messages": messages,

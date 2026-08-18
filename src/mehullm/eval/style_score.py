@@ -1,27 +1,4 @@
-"""Objective style-similarity score.
-
-This is the number the capstone's headline result rests on, so it is measured,
-not judged. An LLM judge is explicitly NOT used for style: judges drift, cannot
-be reproduced six months later, and "does this sound like Mehul?" is exactly the
-question a judge has no grounding to answer.
-
-Six components, weighted:
-
-    C  code-switch   0.25   Hinglish rate + Devanagari ratio  <- the defining trait
-    L  length        0.20   JSD over the reply-length buckets
-    P  punctuation   0.15   lowercase starts, terminal periods, ?, !, ellipsis,
-                            ALLCAPS, char repetition (yaaar), laugh tokens
-    N  n-gram        0.15   weighted Jaccard over top-200 1..3-grams
-    X  perplexity    0.15   supplied externally (base vs tuned on held-out text)
-    E  emoji         0.10   log-ratio of emoji rate
-
-Always reported against two anchors, never alone:
-    ceiling = two disjoint halves of real messages scored against each other
-    floor   = raw hosted-model output
-    normalised = (S - floor) / (ceiling - floor)
-
-A bare 0.61 means nothing without them. Report sub-scores individually.
-"""
+"""Objective style-similarity score."""
 
 from __future__ import annotations
 
@@ -31,41 +8,113 @@ from dataclasses import dataclass, field
 
 import regex
 
-__all__ = ["StyleProfile", "StyleScore", "profile", "compare", "normalised"]
+__all__ = ["StyleProfile", "StyleScore", "compare", "normalised", "profile"]
 
 _WORD = regex.compile(r"[\p{L}\p{N}']+")
 _DEVANAGARI = regex.compile(r"\p{Devanagari}")
 _EMOJI = regex.compile(r"[\p{Emoji_Presentation}\p{Extended_Pictographic}]")
 _LAUGH = regex.compile(r"\b(?:ha(?:ha)+h?|hehe+|lol+|lmao+|rofl)\b", regex.IGNORECASE)
-_REPEAT = regex.compile(r"(\p{L})\1{2,}")          # yaaar, cuteee
+_REPEAT = regex.compile(r"(\p{L})\1{2,}")  # yaaar, cuteee
 _ALLCAPS = regex.compile(r"\b[\p{Lu}]{2,}\b")
 
 # Hindi function words written in Latin script.
 #
-# WORDS THAT ARE ALSO COMMON ENGLISH ARE DELIBERATELY EXCLUDED. An earlier
-# version included "me", "par", "le", "aa", "ha", "na", "se" -- and "Let me know
-# if you have any questions" was therefore scored as Hinglish. Generic assistant
-# English came out at 0.978 on the code-switch component, which carries the
-# largest weight (0.25), so the single most important signal in the metric could
-# not discriminate at all.
-#
-# Precision matters far more than recall here: a missed Hinglish marker costs a
-# little sensitivity, a false one destroys the measurement.
 HINGLISH = {
-    "hai", "hain", "nahi", "nahin", "kya", "kyu", "kyun", "kaise", "kaisa", "acha",
-    "accha", "theek", "thik", "yaar", "yar", "bhai", "bhaiya", "haan", "abhi",
-    "kal", "aaj", "raha", "rahi", "rahe", "karo", "karna", "gaya", "gayi", "hua",
-    "hui", "mera", "meri", "tera", "teri", "apna", "phir", "matlab", "chal",
-    "chalo", "dekh", "dekho", "suno", "bata", "batao", "mujhe", "tujhe", "koi",
-    "kuch", "bohot", "bahut", "thoda", "zyada", "jyada", "pakka", "sahi", "galat",
-    "arre", "arey", "toh", "mein", "aur", "kyunki", "lekin", "magar", "waise",
-    "bilkul", "shayad", "zaroor", "milte", "jaana", "aana", "khana", "paisa",
-    "paise", "ghar", "kaam", "baje", "wala", "wali", "hoga", "hogi", "tha", "thi",
-    "kiya", "diya", "liya", "rakh", "bol", "bolo", "samajh", "pata", "yaad",
+    "hai",
+    "hain",
+    "nahi",
+    "nahin",
+    "kya",
+    "kyu",
+    "kyun",
+    "kaise",
+    "kaisa",
+    "acha",
+    "accha",
+    "theek",
+    "thik",
+    "yaar",
+    "yar",
+    "bhai",
+    "bhaiya",
+    "haan",
+    "abhi",
+    "kal",
+    "aaj",
+    "raha",
+    "rahi",
+    "rahe",
+    "karo",
+    "karna",
+    "gaya",
+    "gayi",
+    "hua",
+    "hui",
+    "mera",
+    "meri",
+    "tera",
+    "teri",
+    "apna",
+    "phir",
+    "matlab",
+    "chal",
+    "chalo",
+    "dekh",
+    "dekho",
+    "suno",
+    "bata",
+    "batao",
+    "mujhe",
+    "tujhe",
+    "koi",
+    "kuch",
+    "bohot",
+    "bahut",
+    "thoda",
+    "zyada",
+    "jyada",
+    "pakka",
+    "sahi",
+    "galat",
+    "arre",
+    "arey",
+    "toh",
+    "mein",
+    "aur",
+    "kyunki",
+    "lekin",
+    "magar",
+    "waise",
+    "bilkul",
+    "shayad",
+    "zaroor",
+    "milte",
+    "jaana",
+    "aana",
+    "khana",
+    "paisa",
+    "paise",
+    "ghar",
+    "kaam",
+    "baje",
+    "wala",
+    "wali",
+    "hoga",
+    "hogi",
+    "tha",
+    "thi",
+    "kiya",
+    "diya",
+    "liya",
+    "rakh",
+    "bol",
+    "bolo",
+    "samajh",
+    "pata",
+    "yaad",
 }
 
 # Excluded on purpose -- ambiguous with common English:
-#   me, par, le, aa, ha, na, se, ke, ki, ka, ya, bas, sab, kar, sun, han, fir
 
 BUCKETS = [(1, 2), (3, 5), (6, 12), (13, 30), (31, 10**9)]
 
@@ -82,11 +131,11 @@ def _bucket(n: int) -> int:
 @dataclass
 class StyleProfile:
     n: int = 0
-    hinglish_rate: float = 0.0        # share of messages using Hindi lexemes
-    devanagari_ratio: float = 0.0     # share of chars in Devanagari
+    hinglish_rate: float = 0.0  # share of messages using Hindi lexemes
+    devanagari_ratio: float = 0.0  # share of chars in Devanagari
     length_hist: list[float] = field(default_factory=lambda: [0.0] * len(BUCKETS))
     punct: dict[str, float] = field(default_factory=dict)
-    emoji_rate: float = 0.0           # emoji per message
+    emoji_rate: float = 0.0  # emoji per message
     ngrams: Counter = field(default_factory=Counter)
 
 
@@ -106,8 +155,6 @@ def profile(messages: list[str]) -> StyleProfile:
         words = _WORD.findall(m)
         low = [w.casefold() for w in words]
         # Token FRACTION, not "contains any". A per-message boolean saturates:
-        # one ambiguous word flips the whole message, and a sentence that is 80%
-        # Hindi scores the same as one with a single Hindi particle.
         total_tokens += len(low)
         hinglish_tokens += sum(1 for w in low if w in HINGLISH)
 
@@ -153,6 +200,7 @@ def profile(messages: list[str]) -> StyleProfile:
 
 def _jsd(a: list[float], b: list[float]) -> float:
     """Jensen-Shannon divergence, base 2 -> already in [0, 1]."""
+
     def kl(x: list[float], y: list[float]) -> float:
         return sum(
             xi * math.log2(xi / yi) for xi, yi in zip(x, y, strict=True) if xi > 0 and yi > 0
@@ -218,22 +266,13 @@ class StyleScore:
 def compare(
     generated: list[str], reference: list[str], *, perplexity_gain: float | None = None
 ) -> StyleScore:
-    """Score `generated` against `reference` (held-out REAL messages).
-
-    `perplexity_gain` is (ppl_base - ppl_tuned) / ppl_base on held-out real
-    messages, computed by the training notebook where the model weights live.
-    Passing None neutralises that component at 0.5 rather than silently
-    inflating or deflating the total.
-    """
+    """Score `generated` against `reference` (held-out REAL messages)."""
     g, r = profile(generated), profile(reference)
     if not g.n or not r.n:
         return StyleScore()
 
     s = StyleScore(n_generated=g.n, n_reference=r.n)
-    # Scaled by the REFERENCE rate, not absolute difference. Mehul's Hinglish
-    # token rate is ~0.13; an absolute-difference formula would give text with
-    # zero Hinglish a score of 1 - 0.13/2 = 0.93, i.e. near-perfect for output
-    # that shares none of the defining trait.
+    # Scaled by the REFERENCE rate, not absolute difference. Mehul's Hinglish.
     denom_h = max(r.hinglish_rate, 0.02)
     denom_d = max(r.devanagari_ratio, 0.01)
     ch = max(0.0, 1.0 - abs(g.hinglish_rate - r.hinglish_rate) / denom_h)
@@ -259,13 +298,7 @@ def normalised(score: float, floor: float, ceiling: float) -> float:
 
 
 def anchors(real_messages: list[str], raw_model_messages: list[str]) -> tuple[float, float]:
-    """Compute the ceiling and floor the headline number is reported against.
-
-    ceiling: split the real messages in half and score one against the other.
-             That is how much a person agrees with themselves -- the practical
-             maximum, and it is NOT 1.0.
-    floor:   raw hosted-model output scored against the real messages.
-    """
+    """Compute the ceiling and floor the headline number is reported against."""
     half = len(real_messages) // 2
     ceiling = compare(real_messages[:half], real_messages[half:]).total if half > 20 else 0.9
     floor = compare(raw_model_messages, real_messages).total if raw_model_messages else 0.3

@@ -1,25 +1,4 @@
-"""Generate the rewriter's INPUT side, locally.
-
-The voice model is a rewriter: (neutral draft + context) -> Mehul's reply. Chat
-logs give us the output side for free, but not the input. This module
-synthesises it with a local model.
-
-Runs locally by requirement: a hosted API would ship raw 1:1 chats to a third
-party, and Gemini's free tier trains on submitted data.
-
-Two variants, and the mix matters:
-  A (60%) neutral paraphrase       -> teaches content fidelity
-  B (40%) verbose assistant draft  -> teaches compression + style transfer, and
-          matches the real inference-time input distribution
-Without B the model only learns to undo a paraphraser's tics; without A it drops
-facts.
-
-Note this deviates from the original plan, which had B answer the context
-freely. That would produce drafts whose CONTENT differs from the real reply,
-training the rewriter to invent -- the precise failure the runtime invariant
-firewall exists to catch. Both variants therefore hold content fixed and vary
-only register.
-"""
+"""Generate the rewriter's INPUT side, locally."""
 
 from __future__ import annotations
 
@@ -38,7 +17,7 @@ import regex
 
 from mehullm.voice.client import OllamaClient, OllamaError
 
-__all__ = ["neutralize", "NeutralizeStats", "SYSTEM_PROMPT"]
+__all__ = ["SYSTEM_PROMPT", "NeutralizeStats", "neutralize"]
 
 # The system prompt the voice model is ultimately trained and served with.
 SYSTEM_PROMPT = (
@@ -49,17 +28,6 @@ SYSTEM_PROMPT = (
 
 # PROMPTING NOTE -- this was rebuilt after a smoke test showed the first
 # attempt was worthless. Two failures, both fixed here:
-#
-#   1. "Rewrite in plain, standard English" produced OUTPUT IDENTICAL TO INPUT.
-#      A 1.7B model does not infer that Hinglish counts as not-English. The
-#      word that works is TRANSLATE.
-#   2. Few-shot examples on the /api/generate completion endpoint were
-#      CONTINUED rather than treated as examples -- the model emitted all three
-#      example answers concatenated. Hence chat turns, via OllamaClient.chat().
-#
-# If the draft comes back equal to the target, the training pair degenerates
-# into an identity mapping and the LoRA learns nothing. `_is_degenerate()`
-# rejects those outright rather than letting them silently poison the dataset.
 
 _SYS_A = (
     "You translate Hinglish (Hindi written in Latin script) into formal English. "
@@ -119,6 +87,7 @@ def _messages_b(context: str, target: str) -> list[dict[str, str]]:
     )
     return msgs
 
+
 VARIANT_B_SHARE = 0.40
 DEFAULT_TRAIN_LIMIT = 12_000
 DEFAULT_VAL_LIMIT = 1_500
@@ -137,15 +106,11 @@ class NeutralizeStats:
     elapsed_s: float = 0.0
 
 
-# Draft cache -- content-addressed, so re-runs and crashes are free
+# Draft cache -- content-addressed, so re-runs and crashes are free.
 
 
 class DraftCache:
-    """SQLite cache keyed by sha256(model|variant|text).
-
-    Resumability falls out of this for free: a crashed run simply finds its
-    earlier work on restart. No separate job queue to keep consistent.
-    """
+    """SQLite cache keyed by sha256(model|variant|text)."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -194,14 +159,7 @@ def _normalise(s: str) -> str:
 
 
 def _is_degenerate(draft: str, target: str) -> bool:
-    """True when the draft is effectively a copy of the reply.
-
-    THE most important check in this module. If draft == target the training
-    pair teaches the identity function: the LoRA has nothing to learn, training
-    loss looks fine, and you only discover the problem when the fine-tuned
-    model turns out no better than the base. The first prompt version produced
-    this for essentially every input.
-    """
+    """True when the draft is effectively a copy of the reply."""
     d, t = _normalise(draft), _normalise(target)
     if not d:
         return True
@@ -212,11 +170,7 @@ def _is_degenerate(draft: str, target: str) -> bool:
 
 
 def _plausible(draft: str, target: str) -> bool:
-    """Reject obviously broken generations before they poison the dataset.
-
-    A local 1.7B will sometimes refuse, echo the prompt, or run away. Cheap
-    structural checks catch most of it; the rest is caught at eval time.
-    """
+    """Reject obviously broken generations before they poison the dataset."""
     d = draft.strip()
     if not d or len(d) < 2:
         return False
@@ -230,15 +184,8 @@ def _plausible(draft: str, target: str) -> bool:
     return not _is_degenerate(draft, target)
 
 
-def _stratified_sample(
-    records: list[dict], limit: int, rng: random.Random
-) -> list[dict]:
-    """Sample while preserving the bucket mix and spreading across chats.
-
-    A flat random sample would over-represent whichever chat is largest -- one
-    conversation is 40% of this corpus -- and the voice model would learn how
-    Mehul talks to one specific person.
-    """
+def _stratified_sample(records: list[dict], limit: int, rng: random.Random) -> list[dict]:
+    """Sample while preserving the bucket mix and spreading across chats."""
     if len(records) <= limit:
         return list(records)
 

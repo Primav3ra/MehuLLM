@@ -1,20 +1,8 @@
-"""Free-tier quota accounting.
-
-There is no billing API to lean on, so usage is counted locally in SQLite and
-the guard runs BEFORE each request. Three things worth knowing:
-
-* Gemini's free-tier RPM/RPD are no longer published. So the configured numbers
-  are a guess, and the runtime LEARNS the real ceiling by recording the request
-  count at the moment of each 429 (`observed_rpd`).
-* The day boundary is midnight America/Los_Angeles, not local midnight.
-  `date.today()` would roll over at the wrong time and let the guard pass while
-  the provider is still refusing.
-* Token counts are estimated locally. Calling a count_tokens endpoint per
-  request would spend the very quota we are trying to protect.
-"""
+"""Free-tier quota accounting."""
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 import time
@@ -44,19 +32,16 @@ CREATE TABLE IF NOT EXISTS provider_state (
   provider      TEXT PRIMARY KEY,
   demoted_until REAL,
   last_error    TEXT,
-  observed_rpd  INTEGER
+  observed_rpd  INTEGER,
+  rpd_day_pt    TEXT
 );
 """
+
+MIGRATIONS = ["ALTER TABLE provider_state ADD COLUMN rpd_day_pt TEXT"]
 
 
 def day_pt(when: float | None = None) -> str:
     return datetime.fromtimestamp(when or time.time(), PT).strftime("%Y-%m-%d")
-
-
-def estimate_tokens(text: str) -> int:
-    """~4 chars/token plus per-message overhead. Deliberately rough: this feeds
-    a safety guard, and the authoritative number arrives later on UsageEvent."""
-    return len(text) // 4 + 8
 
 
 @dataclass(frozen=True)
@@ -70,7 +55,11 @@ class QuotaStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._conn().executescript(SCHEMA)
+        c = self._conn()
+        c.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            with contextlib.suppress(sqlite3.OperationalError):
+                c.execute(stmt)
 
     def _conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
@@ -79,7 +68,6 @@ class QuotaStore:
             c.execute("PRAGMA journal_mode=WAL")
             self._local.c = c
         return c
-
 
     def record(
         self,
@@ -100,16 +88,15 @@ class QuotaStore:
         )
         c.commit()
 
-    def note_rate_limited(self, provider: str) -> None:
-        """Learn the real ceiling: whatever we managed today IS the limit."""
-        used = self.requests_today(provider)
+    def note_daily_limit(self, provider: str, reported: int | None = None) -> None:
+        """Record today's daily ceiling."""
+        used = reported if reported else self.requests_today(provider)
         c = self._conn()
         c.execute(
-            "INSERT INTO provider_state(provider, observed_rpd) VALUES (?,?)"
-            " ON CONFLICT(provider) DO UPDATE SET observed_rpd="
-            "  CASE WHEN observed_rpd IS NULL OR excluded.observed_rpd < observed_rpd"
-            "       THEN excluded.observed_rpd ELSE observed_rpd END",
-            (provider, used),
+            "INSERT INTO provider_state(provider, observed_rpd, rpd_day_pt)"
+            " VALUES (?,?,?) ON CONFLICT(provider) DO UPDATE SET"
+            " observed_rpd=excluded.observed_rpd, rpd_day_pt=excluded.rpd_day_pt",
+            (provider, max(1, used), day_pt()),
         )
         c.commit()
 
@@ -123,36 +110,49 @@ class QuotaStore:
         )
         c.commit()
 
-
     def requests_today(self, provider: str) -> int:
-        row = self._conn().execute(
-            "SELECT COUNT(*) FROM llm_usage WHERE provider=? AND day_pt=?",
-            (provider, day_pt()),
-        ).fetchone()
+        row = (
+            self._conn()
+            .execute(
+                "SELECT COUNT(*) FROM llm_usage WHERE provider=? AND day_pt=?",
+                (provider, day_pt()),
+            )
+            .fetchone()
+        )
         return row[0] if row else 0
 
     def requests_last_minute(self, provider: str) -> int:
-        row = self._conn().execute(
-            "SELECT COUNT(*) FROM llm_usage WHERE provider=? AND ts>?",
-            (provider, time.time() - 60),
-        ).fetchone()
+        row = (
+            self._conn()
+            .execute(
+                "SELECT COUNT(*) FROM llm_usage WHERE provider=? AND ts>?",
+                (provider, time.time() - 60),
+            )
+            .fetchone()
+        )
         return row[0] if row else 0
 
     def demoted_until(self, provider: str) -> float:
-        row = self._conn().execute(
-            "SELECT demoted_until FROM provider_state WHERE provider=?", (provider,)
-        ).fetchone()
+        row = (
+            self._conn()
+            .execute("SELECT demoted_until FROM provider_state WHERE provider=?", (provider,))
+            .fetchone()
+        )
         return (row[0] or 0.0) if row else 0.0
 
     def observed_rpd(self, provider: str) -> int | None:
-        row = self._conn().execute(
-            "SELECT observed_rpd FROM provider_state WHERE provider=?", (provider,)
-        ).fetchone()
+        row = (
+            self._conn()
+            .execute(
+                "SELECT observed_rpd FROM provider_state WHERE provider=? AND rpd_day_pt=?",
+                (provider, day_pt()),
+            )
+            .fetchone()
+        )
         return row[0] if row and row[0] else None
 
     def is_available(self, provider: str, limits: Limits, headroom: float = 0.9) -> bool:
-        """Preflight. Refuse at 90% so the last request does not become a 429
-        mid-turn, which would surface to the user as a broken conversation."""
+        """Preflight."""
         if time.time() < self.demoted_until(provider):
             return False
         rpd = self.observed_rpd(provider) or limits.rpd

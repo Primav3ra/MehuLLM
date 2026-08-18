@@ -1,14 +1,4 @@
-"""Local memory store: sqlite-vec + FTS5 in one file.
-
-BM25 and vector search share a transaction, so hybrid retrieval is one SQL
-round-trip and no extra process runs. sqlite-vec is pre-1.0 -- pin it; every
-vector is regenerable from `chunks.text` via reindex().
-
-Three collections, separate because they feed different prompts:
-  chunks(kind='style') -> voice model, as exemplars
-  chunks(kind='doc')   -> brain, as context
-  facts                -> brain, inside <memory>
-"""
+"""Local memory store: sqlite-vec + FTS5 in one file."""
 
 from __future__ import annotations
 
@@ -22,7 +12,7 @@ from typing import Any
 
 import sqlite_vec
 
-DIM = 384  # intfloat/multilingual-e5-small
+from mehullm.memory.embed import DIM
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS chunks (
@@ -128,10 +118,7 @@ class Fact:
     status: str = "active"
 
 
-# Columns/constraints added after the first release. `CREATE TABLE IF NOT
-# EXISTS` does NOT alter an existing table, so a db created before these
-# existed raises "no such column" at INSERT time -- discovered the hard way,
-# 15 minutes into a run.
+# Columns/constraints added after the first release. `CREATE TABLE IF NOT.
 _FACTS_REQUIRED_COLUMNS = {"verdict", "grounded"}
 _FACTS_REQUIRED_STATUS = "pending"
 
@@ -147,16 +134,7 @@ class MemoryStore:
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
-        """Bring an older `facts` table up to the current shape.
-
-        Two kinds of drift:
-          * missing COLUMNS      -> ALTER TABLE ADD COLUMN (cheap, in place)
-          * changed CHECK constraint -> SQLite cannot alter one, so the table
-            must be rebuilt. Only attempted when `facts` is empty, which is the
-            realistic case (facts are re-derivable by re-running extraction);
-            otherwise we leave it alone and let the caller decide rather than
-            silently destroying reviewed data.
-        """
+        """Bring an older `facts` table up to the current shape."""
         cols = {r[1] for r in c.execute("PRAGMA table_info(facts)")}
         if not cols:
             return
@@ -198,7 +176,6 @@ class MemoryStore:
             self._local.c = c
         return c
 
-
     def add_chunk(
         self,
         text: str,
@@ -234,7 +211,6 @@ class MemoryStore:
     def commit(self) -> None:
         self.conn().commit()
 
-
     def add_fact(
         self,
         *,
@@ -256,9 +232,17 @@ class MemoryStore:
             "INSERT INTO facts(subject,predicate,object,text,single_valued,confidence,"
             "observed_at,source_chunks,status,verdict,grounded) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
-                subject, predicate, object_, text, int(single_valued),
-                confidence, observed_at, json.dumps(source_chunks or []),
-                status, verdict, int(grounded),
+                subject,
+                predicate,
+                object_,
+                text,
+                int(single_valued),
+                confidence,
+                observed_at,
+                json.dumps(source_chunks or []),
+                status,
+                verdict,
+                int(grounded),
             ),
         )
         fid = cur.lastrowid
@@ -268,8 +252,6 @@ class MemoryStore:
         if single_valued and status == "active":
             # Newer value wins, older is SUPERSEDED not deleted -- the chain is
             # how "where did I used to live?" gets answered.
-            # Only fires for ACTIVE facts: a pending fact must not silently
-            # retire an approved one before anyone has looked at it.
             c.execute(
                 "UPDATE facts SET status='superseded', superseded_by=?"
                 " WHERE status='active' AND single_valued=1 AND subject=? AND predicate=?"
@@ -279,93 +261,31 @@ class MemoryStore:
         c.commit()
         return fid
 
-
-    def pending_facts(self, limit: int = 500) -> list[dict]:
-        rows = self.conn().execute(
-            "SELECT id, text, subject, predicate, object, confidence, grounded, verdict,"
-            " observed_at, source_chunks FROM facts WHERE status='pending'"
-            " ORDER BY confidence DESC, id LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def set_status(self, fact_ids: list[int], status: str) -> int:
-        if not fact_ids:
-            return 0
-        c = self.conn()
-        c.executemany(
-            "UPDATE facts SET status=? WHERE id=?", [(status, i) for i in fact_ids]
-        )
-        # Approving a single-valued fact retires older approved ones.
-        if status == "active":
-            for fid in fact_ids:
-                r = c.execute(
-                    "SELECT subject,predicate,single_valued,observed_at FROM facts WHERE id=?",
-                    (fid,),
-                ).fetchone()
-                if r and r["single_valued"]:
-                    c.execute(
-                        "UPDATE facts SET status='superseded', superseded_by=?"
-                        " WHERE status='active' AND single_valued=1 AND subject=?"
-                        " AND predicate=? AND id<>? AND (observed_at IS NULL OR observed_at <= ?)",
-                        (fid, r["subject"], r["predicate"], fid, r["observed_at"] or 0),
-                    )
-        c.commit()
-        return len(fact_ids)
-
-    def source_text(self, fact_id: int) -> str:
-        r = self.conn().execute(
-            "SELECT source_chunks FROM facts WHERE id=?", (fact_id,)
-        ).fetchone()
-        ids = json.loads(r["source_chunks"] or "[]") if r else []
-        if not ids:
-            return ""
-        rows = self.conn().execute(
-            f"SELECT text FROM chunks WHERE id IN ({','.join('?' * len(ids))})", ids
-        ).fetchall()
-        return "\n---\n".join(x["text"] for x in rows)
-
     def nearest_fact(self, embedding: list[float]) -> tuple[int, float] | None:
-        """For dedup: closest live fact and its distance.
-
-        Includes PENDING as well as ACTIVE. Restricting this to active would
-        mean a 3,500-session extraction run creates the same pending fact
-        dozens of times, and the review queue becomes unreadable.
-        Rejected/superseded are excluded on purpose -- a fact you already threw
-        out should not silently absorb a new observation.
-        """
-        row = self.conn().execute(
-            "SELECT v.fact_id, v.distance FROM facts_vec v"
-            " JOIN facts f ON f.id = v.fact_id AND f.status IN ('active','pending')"
-            " WHERE v.embedding MATCH ? AND k = 1",
-            (pack(embedding),),
-        ).fetchone()
+        """For dedup: closest live fact and its distance."""
+        row = (
+            self.conn()
+            .execute(
+                "SELECT v.fact_id, v.distance FROM facts_vec v"
+                " JOIN facts f ON f.id = v.fact_id AND f.status IN ('active','pending')"
+                " WHERE v.embedding MATCH ? AND k = 1",
+                (pack(embedding),),
+            )
+            .fetchone()
+        )
         return (row["fact_id"], row["distance"]) if row else None
 
     def merge_fact(self, fact_id: int, extra_chunks: list[int], confidence: float) -> None:
         c = self.conn()
-        row = c.execute("SELECT source_chunks, confidence FROM facts WHERE id=?", (fact_id,)).fetchone()
+        row = c.execute(
+            "SELECT source_chunks, confidence FROM facts WHERE id=?", (fact_id,)
+        ).fetchone()
         merged = sorted(set(json.loads(row["source_chunks"] or "[]")) | set(extra_chunks))
         c.execute(
             "UPDATE facts SET source_chunks=?, confidence=? WHERE id=?",
             (json.dumps(merged), min(0.99, max(row["confidence"], confidence) + 0.05), fact_id),
         )
         c.commit()
-
-    def active_facts(self, limit: int = 200) -> list[Fact]:
-        rows = self.conn().execute(
-            "SELECT * FROM facts WHERE status='active' ORDER BY confidence DESC, id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [_fact(r) for r in rows]
-
-    def fact_history(self, subject: str, predicate: str) -> list[Fact]:
-        rows = self.conn().execute(
-            "SELECT * FROM facts WHERE subject=? AND predicate=? ORDER BY observed_at DESC",
-            (subject, predicate),
-        ).fetchall()
-        return [_fact(r) for r in rows]
-
 
     def queue_jobs(self, keys: list[str]) -> int:
         c = self.conn()
@@ -374,23 +294,6 @@ class MemoryStore:
         )
         c.commit()
         return len(keys)
-
-    def next_jobs(self, n: int = 50) -> list[str]:
-        return [
-            r["session_key"]
-            for r in self.conn().execute(
-                "SELECT session_key FROM extract_jobs WHERE status='pending' LIMIT ?", (n,)
-            )
-        ]
-
-    def finish_job(self, key: str, ok: bool, error: str = "") -> None:
-        c = self.conn()
-        c.execute(
-            "UPDATE extract_jobs SET status=?, attempts=attempts+1, last_error=? WHERE session_key=?",
-            ("done" if ok else "failed", error[:300], key),
-        )
-        c.commit()
-
 
     def stats(self) -> dict[str, Any]:
         c = self.conn()
@@ -409,7 +312,12 @@ class MemoryStore:
 
 def _fact(r: sqlite3.Row) -> Fact:
     return Fact(
-        id=r["id"], text=r["text"], subject=r["subject"], predicate=r["predicate"],
-        object=r["object"], confidence=r["confidence"], observed_at=r["observed_at"],
+        id=r["id"],
+        text=r["text"],
+        subject=r["subject"],
+        predicate=r["predicate"],
+        object=r["object"],
+        confidence=r["confidence"],
+        observed_at=r["observed_at"],
         status=r["status"],
     )

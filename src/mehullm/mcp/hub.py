@@ -1,40 +1,56 @@
-"""Multi-server MCP supervisor.
-
-Owns connection lifecycle, per-server concurrency, health/restart, and dispatch.
-The official `mcp` SDK handles the wire (JSON-RPC framing, protocol-era
-negotiation, transport headers); everything above that is here.
-
-Two constraints that shaped this:
-
-* STDIO NEEDS A SEMAPHORE OF 1. stdio is a single newline-delimited duplex
-  channel. Concurrent calls are legal at protocol level but many community
-  servers are single-threaded and will interleave or deadlock. Serialise per
-  stdio server; parallelise across servers.
-
-* WINDOWS. `npx`/`uvx` are .cmd shims that CreateProcess cannot exec directly;
-  there is no SIGTERM; orphaned node processes survive a crashed backend and eat
-  RAM this machine does not have. All three are handled below.
-"""
+"""Multi-server MCP supervisor."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from string import Template
 from typing import Any, Literal
 
-from mehullm.mcp.registry import Registry, ToolRef
+from mehullm.mcp.registry import SEP, Registry, ToolRef
+from mehullm.obs import get_logger
 
 Transport = Literal["stdio", "http"]
 State = Literal["idle", "ready", "degraded", "failed", "disabled"]
 
+log = get_logger(__name__)
+
 IS_WINDOWS = sys.platform == "win32"
+
+_PLACEHOLDER = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
+
+
+@lru_cache(maxsize=1)
+def _dotenv() -> dict[str, str]:
+    """Read .env directly."""
+    from mehullm.settings import ROOT
+
+    out: dict[str, str] = {}
+    path = ROOT / ".env"
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def expand(value: str) -> str:
+    """Resolve ${VAR} from the real environment first, then .env."""
+    return Template(value).safe_substitute({**_dotenv(), **os.environ})
 
 
 @dataclass
@@ -52,13 +68,12 @@ class ServerSpec:
     lazy: bool = False
     idle_kill_s: float = 600.0
     max_restarts: int = 3
+    # "auto" negotiates the 2026-07-28 handshake (server/discover) and falls back
+    # to "legacy" (initialize) if that fails. Pin a value only to skip a probe.
+    connect_mode: str = "auto"
 
     def resolved_command(self) -> str | None:
-        """Resolve .cmd/.bat shims on Windows.
-
-        `npx` on Windows is `npx.cmd`; CreateProcess cannot execute it directly
-        and you get a bare FileNotFoundError that looks like the tool is missing.
-        """
+        """Resolve .cmd/.bat shims on Windows."""
         if not self.command:
             return None
         if IS_WINDOWS:
@@ -69,10 +84,34 @@ class ServerSpec:
         return shutil.which(self.command) or self.command
 
     def expanded_env(self) -> dict[str, str]:
-        return {k: os.path.expandvars(v) for k, v in self.env.items()}
+        return {k: expand(v) for k, v in self.env.items()}
 
     def expanded_headers(self) -> dict[str, str]:
-        return {k: os.path.expandvars(v) for k, v in self.headers.items()}
+        return {k: expand(v) for k, v in self.headers.items()}
+
+    def unresolved(self) -> list[str]:
+        """Placeholders that expanded to nothing -- surfaced in the start report so a missing token reads as a missing to."""
+        out = []
+        for src in (self.env, self.headers):
+            for k, v in src.items():
+                if _PLACEHOLDER.search(expand(v)):
+                    out.append(f"{k}={v}")
+        return out
+
+
+def load_server_specs(path: str | Path) -> list[ServerSpec]:
+    """Unknown keys are dropped: servers.yaml is hand-edited."""
+    import yaml
+
+    doc = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    fields = ServerSpec.__dataclass_fields__
+    specs = []
+    for raw in doc.get("servers", []):
+        kw = {k: v for k, v in raw.items() if k in fields}
+        if isinstance(tools := raw.get("tools"), dict) and tools.get("allow"):
+            kw["allow"] = set(tools["allow"])
+        specs.append(ServerSpec(**kw))
+    return specs
 
 
 @dataclass
@@ -84,6 +123,15 @@ class ToolResult:
 
 
 MAX_RESULT_CHARS = 32_000
+
+
+def describe_exc(e: BaseException, depth: int = 0) -> str:
+    """Flatten ExceptionGroups."""
+    if isinstance(e, BaseExceptionGroup) and depth < 4:
+        inner = "; ".join(describe_exc(x, depth + 1) for x in e.exceptions)
+        return f"{type(e).__name__}[{inner}]"
+    text = str(e).strip() or repr(e)
+    return f"{type(e).__name__}: {text[:300]}"
 
 
 class ServerConn:
@@ -111,47 +159,73 @@ class ServerConn:
             await self._connect()
 
     async def _connect(self) -> None:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        """mcp SDK 2.0."""
+        from mcp import Client
 
-        self._stack = AsyncExitStack()
-        try:
-            if self.spec.transport == "http":
-                from mcp.client.streamable_http import streamablehttp_client
+        # Servers in the wild are a MIX of protocol eras. "auto" sends the.
+        modes = ["auto", "legacy"] if self.spec.connect_mode == "auto" else [self.spec.connect_mode]
+        last: Exception | None = None
 
-                read, write, *_ = await self._stack.enter_async_context(
-                    streamablehttp_client(self.spec.url, headers=self.spec.expanded_headers())
-                )
-            else:
-                cmd = self.spec.resolved_command()
-                if not cmd:
-                    raise RuntimeError(f"command {self.spec.command!r} not found on PATH")
-                params = StdioServerParameters(
-                    command=cmd,
-                    args=self.spec.args,
-                    env={**os.environ, **self.spec.expanded_env()},
-                    cwd=self.spec.cwd,
-                )
-                read, write = await self._stack.enter_async_context(stdio_client(params))
+        for mode in modes:
+            self._stack = AsyncExitStack()
+            try:
+                transport = await self._build_transport()
+                # Client enters the transport itself and performs the handshake.
+                self.session = await self._stack.enter_async_context(Client(transport, mode=mode))
+                self.protocol_version = str(getattr(self.session, "protocol_version", "") or "")
+                self.state = "ready"
+                self.error = None
+                self.last_used = time.monotonic()
+                return
+            except Exception as e:
+                last = e
+                # The transport generator is single-use, so a retry must rebuild
+                # it from scratch -- hence the stack is torn down here.
+                await self.aclose()
 
-            self.session = await self._stack.enter_async_context(ClientSession(read, write))
-            init = await self.session.initialize()
-            self.protocol_version = getattr(init, "protocolVersion", None) or str(
-                getattr(init, "protocol_version", "") or ""
+        self.state = "failed"
+        self.error = describe_exc(last) if last else "connect failed"
+        raise last or RuntimeError(self.error)
+
+    async def _build_transport(self) -> Any:
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+
+        assert self._stack is not None
+        if self.spec.transport == "http":
+            import httpx2
+            from mcp.client.streamable_http import streamable_http_client
+
+            # v2 dropped the headers= kwarg; auth rides on the httpx2 client.
+            http = await self._stack.enter_async_context(
+                httpx2.AsyncClient(headers=self.spec.expanded_headers())
             )
-            self.state = "ready"
-            self.error = None
-            self.last_used = time.monotonic()
-        except Exception as e:  # noqa: BLE001
-            await self.aclose()
-            self.state = "failed"
-            self.error = f"{type(e).__name__}: {e}"
-            raise
+            return streamable_http_client(self.spec.url, http_client=http)
+
+        # resolved_command() stays: the SDK has get_windows_executable_command.
+        cmd = self.spec.resolved_command()
+        if not cmd:
+            raise RuntimeError(f"command {self.spec.command!r} not found on PATH")
+        return stdio_client(
+            StdioServerParameters(
+                command=cmd,
+                args=self.spec.args,
+                env={**os.environ, **self.spec.expanded_env()},
+                cwd=self.spec.cwd,
+            )
+        )
 
     async def list_tools(self) -> list[Any]:
+        """Follows next_cursor: v2's tools/list is paginated, and a server with more tools than one page would silently r."""
         await self.ensure()
-        res = await self.session.list_tools()
-        return list(getattr(res, "tools", None) or [])
+        out: list[Any] = []
+        cursor: str | None = None
+        for _ in range(10):  # bounded: a server looping cursors must not hang us
+            res = await self.session.list_tools(cursor=cursor)
+            out.extend(getattr(res, "tools", None) or [])
+            cursor = getattr(res, "next_cursor", None)
+            if not cursor:
+                break
+        return out
 
     async def call(self, tool: str, args: dict, timeout: float | None = None) -> ToolResult:
         await self.ensure()
@@ -168,7 +242,7 @@ class ServerConn:
                     "Do not retry the same call; try a narrower query.",
                     is_error=True,
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self.state = "degraded"
                 self.error = str(e)
                 return ToolResult(f"Tool error: {e}", is_error=True)
@@ -187,8 +261,13 @@ class ServerConn:
         if truncated:
             # One list_messages on a busy chat returns 400 KB and blows both the
             # context window and the TPM ceiling in a single call.
-            text = text[:MAX_RESULT_CHARS] + f"\n[truncated; {n - MAX_RESULT_CHARS} chars omitted — narrow your query]"
-        return ToolResult(text, is_error=bool(getattr(res, "isError", False)), bytes_=n, truncated=truncated)
+            text = (
+                text[:MAX_RESULT_CHARS]
+                + f"\n[truncated; {n - MAX_RESULT_CHARS} chars omitted — narrow your query]"
+            )
+        return ToolResult(
+            text, is_error=bool(getattr(res, "isError", False)), bytes_=n, truncated=truncated
+        )
 
     async def aclose(self) -> None:
         if self._stack is not None:
@@ -206,25 +285,44 @@ class MCPHub:
     def __init__(self, specs: list[ServerSpec], registry: Registry | None = None):
         self.specs = {s.id: s for s in specs}
         self.conns = {s.id: ServerConn(s) for s in specs}
-        self.registry = registry or Registry()
+        # `registry or Registry()` was a silent, total failure of MCP tooling.
+        self.registry = Registry() if registry is None else registry
 
     async def start(self) -> dict[str, str]:
-        """Connect non-lazy servers and register their tools.
-
-        A server that fails to start does NOT abort startup -- its tools are
-        simply absent and the agent is told the capability is unavailable.
-        """
+        """Connect non-lazy servers and register their tools."""
         report: dict[str, str] = {}
         for sid, conn in self.conns.items():
             if conn.spec.lazy:
                 report[sid] = "lazy"
                 continue
+            if missing := conn.spec.unresolved():
+                report[sid] = f"failed: unresolved config placeholders {missing}"
+                continue
             try:
-                tools = await conn.list_tools()
+                # BOUNDED. This was an unbounded await, so one slow remote server.
+                tools = await asyncio.wait_for(conn.list_tools(), timeout=conn.spec.timeout_s)
                 n = self.registry.ingest(sid, tools, conn.spec.allow)
                 report[sid] = f"ready ({n} tools, protocol {conn.protocol_version or '?'})"
-            except Exception as e:  # noqa: BLE001
-                report[sid] = f"failed: {e}"
+            except (Exception, TimeoutError) as e:
+                report[sid] = f"failed: {describe_exc(e)}"
+        return report
+
+    async def register_all(self) -> dict[str, str]:
+        """start() PLUS schema harvest for lazy servers."""
+        report = await self.start()
+        for sid, conn in self.conns.items():
+            if not conn.spec.lazy or conn.state == "disabled":
+                continue
+            if missing := conn.spec.unresolved():
+                report[sid] = f"skipped: unresolved placeholders {missing}"
+                continue
+            try:
+                await asyncio.wait_for(self.ensure_registered(sid), timeout=conn.spec.timeout_s)
+                n = sum(1 for d in self.registry.tool_defs() if d.name.startswith(f"{sid}{SEP}"))
+                report[sid] = f"ready ({n} tools, protocol {conn.protocol_version or '?'})"
+            except (Exception, TimeoutError) as e:
+                self.registry.drop_server(sid)
+                report[sid] = f"failed: {describe_exc(e)}"
         return report
 
     async def ensure_registered(self, server_id: str) -> None:
@@ -244,19 +342,21 @@ class MCPHub:
                 is_error=True,
             )
         try:
-            await self.ensure_registered(ref.server_id)
-        except Exception as e:  # noqa: BLE001
+            # BOUNDED. A lazy server's first connect spawns a process and does a.
+            await asyncio.wait_for(
+                self.ensure_registered(ref.server_id), timeout=conn.spec.timeout_s
+            )
+        except (Exception, TimeoutError) as e:
             self.registry.drop_server(ref.server_id)
             return ToolResult(
-                f"Server '{ref.server_id}' is unavailable this turn ({e}). "
-                "Use another approach or tell the user.",
+                f"Server '{ref.server_id}' is unavailable this turn "
+                f"({describe_exc(e)}). Use another approach or tell the user.",
                 is_error=True,
             )
         return await conn.call(ref.tool_name, args, timeout)
 
     async def reap_idle(self) -> list[str]:
-        """Shut down idle stdio servers. Each is a full node/python process and
-        this machine has ~0.4 GB of free RAM."""
+        """Free idle stdio processes, KEEPING their tool schemas registered."""
         killed = []
         now = time.monotonic()
         for sid, conn in self.conns.items():
@@ -267,9 +367,17 @@ class MCPHub:
                 and now - conn.last_used > conn.spec.idle_kill_s
             ):
                 await conn.aclose()
-                self.registry.drop_server(sid)
                 killed.append(sid)
+        if killed:
+            log.info("mcp.reaped", servers=killed)
         return killed
+
+    async def reaper(self, every_s: float = 60.0) -> None:
+        """Background loop. idle_kill_s was configured but never scheduled."""
+        while True:
+            await asyncio.sleep(every_s)
+            with contextlib.suppress(Exception):
+                await self.reap_idle()
 
     async def set_enabled(self, server_id: str, enabled: bool) -> None:
         conn = self.conns[server_id]
@@ -300,11 +408,7 @@ class MCPHub:
             self._reap_orphans()
 
     def _reap_orphans(self) -> None:
-        """Windows has no SIGTERM and stdio children can outlive us.
-
-        Best-effort: the process tree is killed via taskkill /T. Without this a
-        crashed backend leaves node processes holding hundreds of MB.
-        """
+        """Windows has no SIGTERM and stdio children can outlive us."""
         for conn in self.conns.values():
             proc = getattr(conn.session, "_process", None)
             pid = getattr(proc, "pid", None)

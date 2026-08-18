@@ -1,15 +1,8 @@
-# MCP servers.
-#
-# `tools.allow` is an ALLOWLIST, not a denylist. A tool absent from it is never
-# converted into a schema, so the model cannot even name it.
-#
-# TARGET: <= 30 tools TOTAL across all servers. Groq's free tier allows only
-# 6-12K tokens/min and 40 tool schemas cost 3-5K tokens PER REQUEST -- blow that
-# and failover fails exactly when you need it.
+# tools.allow is an ALLOWLIST: an absent tool never becomes a schema.
+# Target <=30 tools total -- schema bloat is a hard TPM failure, not a cost.
 
 servers:
-  # GitHub is built first on purpose: remote HTTP, free PAT auth, and no
-  # subprocess, so the hub can be proven end-to-end before Windows stdio pain.
+  # Remote HTTP, so no subprocess. Built first for that reason.
   - id: github
     transport: http
     url: https://api.githubcopilot.com/mcp/
@@ -24,8 +17,7 @@ servers:
         - create_issue
     timeout_s: 30
 
-  # No API key, no signup, no card. Swap for Tavily (1000/mo free, still no
-  # card) if quality disappoints -- one line, no code change.
+  # No key, no signup. Tavily is a drop-in swap if quality disappoints.
   - id: search
     transport: stdio
     command: uvx
@@ -36,29 +28,34 @@ servers:
     idle_kill_s: 600
     timeout_s: 30
 
-  # LOCAL npm server + internal integration token. The hosted Notion MCP
-  # requires interactive user OAuth and rejects bearer tokens, so it cannot run
-  # headless. Bonus: an integration only sees pages you explicitly share with
-  # it -- least privilege for free.
+  # Local npm server: the hosted Notion MCP needs user OAuth and cannot run headless.
   - id: notion
     transport: stdio
     command: npx
     args: ["-y", "@notionhq/notion-mcp-server"]
     env:
       NOTION_TOKEN: "${NOTION_TOKEN}"
+    # Names verified against the running server; the friendly ones do not exist.
+    # -markdown variants over block-level ones: nested block JSON burns the budget.
     tools:
-      allow: [search, fetch, create-pages, update-page]
+      allow:
+        - API-post-search
+        - API-retrieve-page-markdown
+        - API-post-page
+        - API-update-page-markdown
     lazy: true
     idle_kill_s: 600
 
-  # SCOPES: gmail.readonly + gmail.compose ONLY. Never gmail.send in v1 --
-  # drafts-only IS the guardrail. A bad agent decision costs a bad draft, not a
-  # sent email.
+  # gmail:drafts, NOT --tools gmail: the latter requests gmail.send in the
+  # consent URL. Levels are cumulative, so drafts grants read+compose, never send.
   - id: gmail
     transport: stdio
     command: uvx
-    args: ["workspace-mcp", "--tools", "gmail"]
+    args: ["workspace-mcp", "--single-user", "--permissions", "gmail:drafts"]
+    # This server reads CLIENT_ID/CLIENT_SECRET, not the *_SECRETS path.
     env:
+      GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID}"
+      GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET}"
       GOOGLE_OAUTH_CLIENT_SECRETS: "${GOOGLE_OAUTH_CLIENT_SECRETS}"
     tools:
       allow: [search_gmail_messages, get_gmail_message_content, draft_gmail_message]

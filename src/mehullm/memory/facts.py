@@ -1,13 +1,4 @@
-"""Load the curated fact bank from facts/*.yaml into memory.
-
-Facts are hand-written, so they enter as `status='active'` -- there is no review
-queue, because the author is the reviewer.
-
-Ids are explicit and stable (F001, F102...) so that `[F102]` citations in an
-answer, in an eval scenario, and in a trace all mean the same thing six months
-from now. Loading is an UPSERT keyed on that id: edit a line, re-run, and the
-fact is updated in place rather than duplicated.
-"""
+"""Load the curated fact bank from facts/*.yaml into memory."""
 
 from __future__ import annotations
 
@@ -27,8 +18,14 @@ FACTS_DIR = "facts"
 # Predicates that hold ONE value at a time: a newer one supersedes the older,
 # which is retired rather than deleted so "where did I used to live?" works.
 SINGLE_VALUED = {
-    "lives_in", "studies_at", "works_at", "current_role", "current_project",
-    "relationship_status", "phone_of", "email_of",
+    "lives_in",
+    "studies_at",
+    "works_at",
+    "current_role",
+    "current_project",
+    "relationship_status",
+    "phone_of",
+    "email_of",
 }
 
 
@@ -58,17 +55,7 @@ def _parse_when(v) -> int | None:
 
 
 def _embed_text(e: dict) -> str:
-    """What gets EMBEDDED -- not what gets displayed.
-
-    A hand-written bank mixes voice: "My full name is Mehul" next to "Mehul
-    lives in Hyderabad". A first-person query ("where do I live") embeds closer
-    to first-person facts, so the third-person ones were being missed entirely
-    -- F001 and F003 fell out of the top 8 on the two most basic questions.
-
-    Prepending a canonical "<subject> <predicate> <object>" phrasing puts both
-    voices in the same vector, so retrieval stops depending on how the fact
-    happened to be worded.
-    """
+    """What gets EMBEDDED -- not what gets displayed."""
     pred = str(e.get("predicate", "")).replace("_", " ").strip()
     obj = str(e.get("object", "")).strip()
     subj = str(e.get("subject", "Mehul")).strip()
@@ -93,8 +80,6 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
                 st.errors.append(f"{path.name}: entry is not a mapping: {raw!r}")
                 continue
             # An unfilled template line is the normal state, not an error --
-            # flagging each one would bury the real problems once you start
-            # filling them in.
             if not str(raw.get("text", "")).strip():
                 st.blank += 1
                 continue
@@ -113,9 +98,7 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
     if not entries:
         return st
 
-    # Self-heal an facts_fts built before the porter tokenizer. It is an
-    # external-content index, so dropping it loses nothing -- 'rebuild' below
-    # regenerates it from the facts table.
+    # Self-heal an facts_fts built before the porter tokenizer. It is an.
     sql = con.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='facts_fts'"
     ).fetchone()
@@ -152,17 +135,22 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
             " observed_at=excluded.observed_at, status=excluded.status,"
             " superseded_by=excluded.superseded_by",
             (
-                fid, str(e.get("subject", "Mehul")), pred, str(e.get("object", "")),
-                e["text"], int(single), float(e.get("confidence", 1.0)),
-                _parse_when(e.get("observed_at")) or now, json.dumps([]),
-                str(e.get("status", "active")), "curated", 1,
+                fid,
+                str(e.get("subject", "Mehul")),
+                pred,
+                str(e.get("object", "")),
+                e["text"],
+                int(single),
+                float(e.get("confidence", 1.0)),
+                _parse_when(e.get("observed_at")) or now,
+                json.dumps([]),
+                str(e.get("status", "active")),
+                "curated",
+                1,
                 int(str(e["superseded_by"]).lstrip("Ff")) if e.get("superseded_by") else None,
             ),
         )
-        # facts_fts is EXTERNAL-CONTENT (content='facts'), so it is rebuilt in
-        # one shot after the loop -- a direct DELETE on such a table is illegal
-        # and FTS5 reports it as "database disk image is malformed", which sends
-        # you hunting for corruption that isn't there.
+        # facts_fts is EXTERNAL-CONTENT (content='facts'), so it is rebuilt in.
         con.execute("DELETE FROM facts_vec WHERE fact_id=?", (fid,))
         con.execute("INSERT INTO facts_vec(fact_id, embedding) VALUES (?,?)", (fid, pack(vec)))
 

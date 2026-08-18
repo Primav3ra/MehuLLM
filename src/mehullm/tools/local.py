@@ -1,12 +1,4 @@
-"""Native (non-MCP) tools, registered alongside MCP tools.
-
-These are how the agent actually reaches memory. Deliberately native rather than
-an MCP server: they need in-process access to the store and the run's vault, and
-routing them through a subprocess would buy nothing on a machine this tight.
-
-They still go through the SAME guardrail interceptor as every MCP tool -- there
-is no second path to a tool call.
-"""
+"""Native (non-MCP) tools, registered alongside MCP tools."""
 
 from __future__ import annotations
 
@@ -83,7 +75,7 @@ class LocalTools:
                 return self._remember(args), False
             if name == "local__now":
                 return time.strftime("%A, %d %B %Y, %H:%M %Z"), False
-        except Exception as e:  # noqa: BLE001 -- surfaces as a tool error, never kills the turn
+        except Exception as e:
             return f"Local tool error: {type(e).__name__}: {e}", True
         return f"Unknown local tool {name!r}.", True
 
@@ -128,7 +120,7 @@ class LocalTools:
             text=text,
             embedding=vec,
             single_valued=pred in SINGLE_VALUED,
-            confidence=0.85,          # user-asserted beats extracted
+            confidence=0.85,  # user-asserted beats extracted
             observed_at=int(time.time()),
         )
         return f"Remembered as [F{fid}]."
@@ -141,11 +133,11 @@ def register(registry, store: MemoryStore) -> LocalTools:
     tools = LocalTools(store)
     for td in TOOL_DEFS:
         short = td.name.split("__", 1)[1]
-        registry._refs[td.name] = ToolRef(  # noqa: SLF001 -- registry is ours
+        registry._refs[td.name] = ToolRef(
             server_id="local",
             tool_name=short,
             namespaced=td.name,
             annotations={"readOnlyHint": short in ("memory_search", "now")},
         )
-        registry._defs[td.name] = td  # noqa: SLF001
+        registry._defs[td.name] = td
     return tools

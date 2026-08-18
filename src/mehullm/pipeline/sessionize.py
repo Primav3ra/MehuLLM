@@ -1,19 +1,4 @@
-"""Turn merging, sessionisation, and (context -> reply) pair construction.
-
-Shared by the census (`stats.py`) and the SFT builder, so the number the
-go/no-go gate reports is the *same* number the training set will actually have.
-Two separate implementations would drift and the gate would lie.
-
-The single most important step here is BURST MERGING. A WhatsApp reply is
-usually 2-4 messages sent in quick succession:
-
-    Mehul: haan yaar
-    Mehul: kaam khatam nahi ho raha
-    Mehul: bas thoda aur
-
-Training on those as three independent targets teaches the model to emit
-one-line fragments. Merged into one turn, it learns the actual rhythm.
-"""
+"""Turn merging, sessionisation, and (context -> reply) pair construction."""
 
 from __future__ import annotations
 
@@ -22,7 +7,7 @@ from datetime import datetime
 
 from mehullm.pipeline.whatsapp_parser import Message
 
-__all__ = ["Turn", "Session", "Pair", "merge_bursts", "split_sessions", "build_pairs"]
+__all__ = ["Pair", "Session", "Turn", "build_pairs", "merge_bursts", "split_sessions"]
 
 BURST_WINDOW_S = 180  # consecutive same-sender messages within 3 min = one turn
 SESSION_GAP_S = 6 * 3600  # > 6 h apart starts a new conversation
@@ -38,20 +23,10 @@ class Turn:
     ts_end: datetime
     n_messages: int = 1
 
-    @property
-    def n_chars(self) -> int:
-        return len(self.text)
-
 
 @dataclass(slots=True)
 class Session:
     turns: list[Turn] = field(default_factory=list)
-
-    @property
-    def span_s(self) -> float:
-        if not self.turns:
-            return 0.0
-        return (self.turns[-1].ts_end - self.turns[0].ts_start).total_seconds()
 
 
 @dataclass(slots=True)
@@ -102,13 +77,7 @@ def build_pairs(
     context_turns: int = CONTEXT_TURNS,
     max_gap_s: int = CONTEXT_MAX_GAP_S,
 ) -> list[Pair]:
-    """Emit one (context -> reply) pair per turn authored by ``self_aliases``.
-
-    A target is only usable if somebody *else* spoke recently. Without that
-    guard you collect unprompted monologues -- "bhai sun", "hello", "?" sent
-    into a dead chat -- which teach the model to open conversations rather
-    than to reply to them.
-    """
+    """Emit one (context -> reply) pair per turn authored by ``self_aliases``."""
     folded = {a.casefold() for a in self_aliases}
     pairs: list[Pair] = []
 

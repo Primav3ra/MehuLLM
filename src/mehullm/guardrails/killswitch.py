@@ -1,9 +1,4 @@
-"""Kill switch and token-bucket rate limiting.
-
-The kill switch is PERSISTED. An in-memory flag that clears on the next
-`uvicorn --reload` is not a kill switch -- it is a suggestion. It is checked at
-three points: request admission, before every tool call, and between loop steps.
-"""
+"""Kill switch and token-bucket rate limiting."""
 
 from __future__ import annotations
 
@@ -87,11 +82,7 @@ class RateLimited(RuntimeError):
 
 
 class RateLimiter:
-    """Per-tool and per-server token buckets.
-
-    Matters most for metered free tiers: Alpha Vantage allows ~25 requests/day,
-    and without this the agent discovers that cap by burning it in one turn.
-    """
+    """Per-tool and per-server token buckets."""
 
     def __init__(self, per_tool: dict[str, tuple[int, float]] | None = None):
         self._specs = per_tool or {}

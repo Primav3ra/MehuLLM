@@ -1,11 +1,4 @@
-"""Run the scenario bank against the agent and grade the results.
-
-Drives the real loop -- real router, interceptor, registry. Only tool RESULTS
-are injected, so injection and server-failure scenarios are reproducible.
-
-Results land in eval_runs/eval_results keyed by git sha and model, so "did this
-make things worse" is a SQL query.
-"""
+"""Run the scenario bank against the agent and grade the results."""
 
 from __future__ import annotations
 
@@ -21,6 +14,9 @@ from typing import Any
 from mehullm.agent.run_manager import RunManager
 from mehullm.eval.bank import Scenario, seed_db
 from mehullm.eval.graders import AssertionResult, Transcript, run_assertions
+from mehullm.memory.retrieve import Hit, render_memory_block
+from mehullm.persistence import tracing
+from mehullm.settings import settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS eval_runs (
@@ -61,9 +57,7 @@ class BankReport:
 
     @property
     def pass_rate(self) -> float:
-        """Weighted. A weight-3 safety scenario must not be worth the same as a
-        weight-1 style probe -- otherwise a suite can go green while the
-        guardrails regress."""
+        """Weighted."""
         tot = sum(r.scenario.weight for r in self.results)
         if not tot:
             return 0.0
@@ -78,14 +72,13 @@ class BankReport:
         return {k: (v[0], v[1]) for k, v in sorted(out.items())}
 
 
-# ------------------------------------------------------------ event capture
+# ------------------------------------------------------------ event capture.
 
 
-def _transcript_from(events: list[dict[str, Any]], sid: str,
-                     latency_ms: int) -> Transcript:
-    """Fold the SSE stream into gradeable shape. Reads the event stream, not the
-    loop internals -- the same contract the frontend consumes."""
+def _transcript_from(events: list[dict[str, Any]], sid: str, latency_ms: int) -> Transcript:
+    """Fold the SSE stream into gradeable shape."""
     t = Transcript(scenario_id=sid, latency_ms=latency_ms, events=events)
+    t.trace_id = next((e.get("trace_id", "") for e in events if e.get("trace_id")), "")
     narration: list[str] = []
     voice: list[str] = []
     for e in events:
@@ -115,7 +108,7 @@ def _transcript_from(events: list[dict[str, Any]], sid: str,
     return t
 
 
-# ------------------------------------------------------------------- runner
+# ------------------------------------------------------------------- runner.
 
 
 class BankRunner:
@@ -124,17 +117,15 @@ class BankRunner:
         *,
         loop_factory: Callable[[Scenario, Path | None], Any],
         base_db: str | Path | None = None,
-        scratch_dir: str | Path = "data/derived/eval",
+        scratch_dir: str | Path | None = None,
         judge: Any = None,
         auto_deny: bool = True,
     ):
         self.loop_factory = loop_factory
         self.base_db = Path(base_db) if base_db else None
-        self.scratch_dir = Path(scratch_dir)
+        self.scratch_dir = Path(scratch_dir or Path(settings.mehullm_derived_dir) / "eval")
         self.judge = judge
-        # Confirmations resolve as DENY by default. An eval that auto-approves
-        # measures nothing -- the assertion is that the card FIRED, and letting
-        # the action then proceed would send real email from a test suite.
+        # Confirmations resolve as DENY by default. An eval that auto-approves.
         self.auto_deny = auto_deny
         self.runs = RunManager()
 
@@ -151,11 +142,12 @@ class BankRunner:
             async for ev in run.subscribe(after_seq=0):
                 captured.append(ev.to_dict())
                 if ev.type == "confirmation_request" and self.auto_deny:
-                    run.resolve(ev.data["interaction_id"],
-                                _deny("denied by eval harness"))
+                    run.resolve(ev.data["interaction_id"], _deny("denied by eval harness"))
                 if ev.type == "done":
                     break
 
+        if (store := tracing._store) is not None:
+            store.start_trace(run.trace_id, f"eval:{s.id}", s.prompt)
         t0 = time.monotonic()
         drainer = asyncio.create_task(drain())
         try:
@@ -175,20 +167,34 @@ class BankRunner:
 
         latency = int((time.monotonic() - t0) * 1000)
         t = _transcript_from(captured, s.id, latency)
-        res = ScenarioResult(scenario=s, transcript=t,
-                             assertions=run_assertions(t, s.assertions))
+        if (store := tracing._store) is not None:
+            store.end_trace(run.trace_id, status=t.status, final_output=t.final_text, error=t.error)
+        res = ScenarioResult(scenario=s, transcript=t, assertions=run_assertions(t, s.assertions))
         if self.judge and s.judged:
             res.judge = await self.judge.judge(s, t)
             if res.judge and not res.judge.get("correct", True):
-                res.assertions.append(AssertionResult(
-                    "judge", False, res.judge.get("reason", "judge said incorrect")))
+                res.assertions.append(
+                    AssertionResult("judge", False, res.judge.get("reason", "judge said incorrect"))
+                )
         return res
 
-    async def run_bank(self, scenarios: list[Scenario],
-                       on_result: Callable[[ScenarioResult], None] | None = None
-                       ) -> BankReport:
+    async def run_bank(
+        self, scenarios: list[Scenario], on_result: Callable[[ScenarioResult], None] | None = None
+    ) -> BankReport:
         rep = BankReport()
         t0 = time.monotonic()
+        # Start clean. Scratch dbs from an earlier run are what get locked, and a
+        # stale one is never wanted -- every scenario reseeds from base_db anyway.
+        if self.scratch_dir.exists():
+            # -wal and -shm too, NOT just *.db. A stale write-ahead log sitting
+            # beside a freshly copied database is worse than a stale database:
+            for pat in ("*.db", "*.db-wal", "*.db-shm"):
+                for p in self.scratch_dir.glob(pat):
+                    with _suppress():
+                        p.unlink()
+        if warmup := getattr(self.loop_factory, "warmup", None):
+            report = await warmup()
+            print(f"  mcp: {report}")
         for s in scenarios:
             r = await self.run_one(s)
             rep.results.append(r)
@@ -199,44 +205,67 @@ class BankRunner:
 
 
 def _memory_block(s: Scenario) -> str:
-    """Render seeded facts the way retrieval would, so the prompt the model sees
-    in an eval is byte-identical in shape to production."""
+    """Render seeded facts through the PRODUCTION renderer."""
     if not s.seed_facts:
         return ""
-    lines = ["<memory>"]
-    for f in s.seed_facts:
-        if f.get("status", "active") != "active":
-            continue
-        lines.append(f"[{f['id']} · conf {float(f.get('confidence', 0.9)):.1f}] {f['text']}")
-    lines.append("</memory>")
-    return "\n".join(lines) if len(lines) > 2 else ""
+    hits = [
+        Hit(
+            id=int(str(f["id"]).lstrip("F")),
+            text=f["text"],
+            kind="fact",
+            score=1.0,
+            meta={
+                "confidence": float(f.get("confidence", 0.9)),
+                "observed_at": f.get("observed_at"),
+                "predicate": f.get("predicate", ""),
+            },
+        )
+        for f in s.seed_facts
+        if f.get("status", "active") == "active"
+    ]
+    return render_memory_block(hits) if hits else ""
 
 
 def _deny(reason: str):
     from mehullm.agent.run_manager import Decision
+
     return Decision(approved=False, reason=reason, by="policy")
 
 
 class _suppress:
-    def __enter__(self): return self
-    def __exit__(self, *a): return True
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return True
 
 
-# --------------------------------------------------------------- persistence
+# --------------------------------------------------------------- persistence.
 
 
 def git_sha() -> str:
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, timeout=5,
-                              check=True).stdout.strip()
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.strip()
     except Exception:
         return "unknown"
 
 
-def persist(db_path: str | Path, rep: BankReport, *, tag: str = "",
-            brain_model: str = "", voice_model: str = "",
-            embed_model: str = "", config: dict[str, Any] | None = None) -> int:
+def persist(
+    db_path: str | Path,
+    rep: BankReport,
+    *,
+    tag: str = "",
+    brain_model: str = "",
+    voice_model: str = "",
+    embed_model: str = "",
+    config: dict[str, Any] | None = None,
+) -> int:
     import sqlite3
 
     con = sqlite3.connect(db_path)
@@ -246,20 +275,39 @@ def persist(db_path: str | Path, rep: BankReport, *, tag: str = "",
             "INSERT INTO eval_runs (started_at, finished_at, git_sha, voice_model,"
             " brain_model, embed_model, config_json, style_score, pass_rate, tag)"
             " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (int(rep.started_at), int(time.time()), git_sha(), voice_model,
-             brain_model, embed_model, json.dumps(config or {}),
-             rep.style_score, rep.pass_rate, tag),
+            (
+                int(rep.started_at),
+                int(time.time()),
+                git_sha(),
+                voice_model,
+                brain_model,
+                embed_model,
+                json.dumps(config or {}),
+                rep.style_score,
+                rep.pass_rate,
+                tag,
+            ),
         )
         rid = cur.lastrowid
         con.executemany(
             "INSERT INTO eval_results (run_id, scenario_id, category, weight,"
             " passed, failed_assertions, judge_json, latency_ms, output, trace_id)"
             " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [(rid, r.scenario.id, r.scenario.category, r.scenario.weight,
-              int(r.passed), json.dumps(r.failures),
-              json.dumps(r.judge) if r.judge else None,
-              r.transcript.latency_ms, r.transcript.final_text[:4000], "")
-             for r in rep.results],
+            [
+                (
+                    rid,
+                    r.scenario.id,
+                    r.scenario.category,
+                    r.scenario.weight,
+                    int(r.passed),
+                    json.dumps(r.failures),
+                    json.dumps(r.judge) if r.judge else None,
+                    r.transcript.latency_ms,
+                    r.transcript.final_text[:4000],
+                    getattr(r.transcript, "trace_id", ""),
+                )
+                for r in rep.results
+            ],
         )
         con.commit()
         return int(rid or 0)
@@ -267,10 +315,8 @@ def persist(db_path: str | Path, rep: BankReport, *, tag: str = "",
         con.close()
 
 
-def compare_to_last_green(db_path: str | Path, rep: BankReport,
-                          tag: str = "") -> list[str]:
-    """Drift alarms (§10): category pass rate down >10 pp, style down >0.05,
-    p95 latency up >50%. Returns human-readable alarm lines."""
+def compare_to_last_green(db_path: str | Path, rep: BankReport, tag: str = "") -> list[str]:
+    """Drift alarms (§10): category pass rate down >10 pp, style down >0.05, p95 latency up >50%."""
     import sqlite3
 
     con = sqlite3.connect(db_path)
@@ -278,7 +324,8 @@ def compare_to_last_green(db_path: str | Path, rep: BankReport,
         con.executescript(SCHEMA)
         row = con.execute(
             "SELECT id, style_score FROM eval_runs WHERE pass_rate >= 0.9"
-            + (" AND tag = ?" if tag else "") + " ORDER BY id DESC LIMIT 1",
+            + (" AND tag = ?" if tag else "")
+            + " ORDER BY id DESC LIMIT 1",
             (tag,) if tag else (),
         ).fetchone()
         if not row:
@@ -287,7 +334,8 @@ def compare_to_last_green(db_path: str | Path, rep: BankReport,
         prev: dict[str, tuple[int, int]] = {}
         for cat, p, n in con.execute(
             "SELECT category, SUM(passed), COUNT(*) FROM eval_results"
-            " WHERE run_id = ? GROUP BY category", (prev_id,)
+            " WHERE run_id = ? GROUP BY category",
+            (prev_id,),
         ):
             prev[cat] = (p or 0, n or 0)
     finally:
@@ -300,8 +348,10 @@ def compare_to_last_green(db_path: str | Path, rep: BankReport,
         drop = prev[cat][0] / prev[cat][1] - p / n
         if drop > 0.10:
             alarms.append(f"{cat}: pass rate down {drop * 100:.0f} pp vs run #{prev_id}")
-    if (rep.style_score is not None and prev_style is not None
-            and prev_style - rep.style_score > 0.05):
-        alarms.append(
-            f"style_score down {prev_style - rep.style_score:.3f} vs run #{prev_id}")
+    if (
+        rep.style_score is not None
+        and prev_style is not None
+        and prev_style - rep.style_score > 0.05
+    ):
+        alarms.append(f"style_score down {prev_style - rep.style_score:.3f} vs run #{prev_id}")
     return alarms

@@ -1,18 +1,4 @@
-"""Runs decoupled from HTTP connections.
-
-THIS IS THE PIECE THAT MAKES CONFIRMATIONS WORK, and it has to exist before the
-confirmation feature, not after.
-
-A confirmation gate must suspend the loop mid-flight and resume when a decision
-arrives on a DIFFERENT HTTP request, minutes later, possibly after the SSE
-connection dropped and reconnected. That requires the run to be a durable,
-addressable object with its own lifetime -- not a coroutine owned by a request.
-
-So: POST /chat creates a Run, spawns run.task, and returns an SSE response that
-is merely *a subscriber*. If the browser disconnects the loop keeps going.
-GET /chat/{id}/events?after_seq=N replays the ring buffer then attaches live,
-so nothing is lost across a reload.
-"""
+"""Runs decoupled from HTTP connections."""
 
 from __future__ import annotations
 
@@ -57,6 +43,7 @@ class Run:
     finished: bool = False
     status: str = "running"
     final_text: str = ""
+    error: str = ""
 
     async def emit(self, ev: Event) -> None:
         self.seq += 1
@@ -95,7 +82,6 @@ class Run:
         finally:
             self.subscribers.discard(q)
 
-
     def new_interaction(self) -> tuple[str, asyncio.Future]:
         iid = f"cnf_{uuid.uuid4().hex[:8]}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -103,8 +89,7 @@ class Run:
         return iid, fut
 
     def resolve(self, interaction_id: str, decision: Decision) -> bool:
-        """Returns False if unknown or already resolved -- double-clicks and
-        retries must 409, not crash."""
+        """Returns False if unknown or already resolved -- double-clicks and retries must 409, not crash."""
         fut = self.pending.get(interaction_id)
         if fut is None or fut.done():
             return False
@@ -143,13 +128,13 @@ class RunManager:
     def _evict(self) -> None:
         if len(self._runs) <= self._max:
             return
-        finished = sorted(
-            (r for r in self._runs.values() if r.finished), key=lambda r: r.started
-        )
+        finished = sorted((r for r in self._runs.values() if r.finished), key=lambda r: r.started)
         for r in finished[: len(self._runs) - self._max]:
             self._runs.pop(r.id, None)
 
-    def cancel_all(self, ) -> int:
+    def cancel_all(
+        self,
+    ) -> int:
         n = 0
         for r in self.active():
             r.cancel()

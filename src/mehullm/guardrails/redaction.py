@@ -1,21 +1,4 @@
-"""Reversible PII vault for the runtime path.
-
-Distinct from pipeline/pii.py, which is a ONE-WAY scrubber for training data.
-At runtime, destructive redaction would break the agent: "email Arjun" becomes
-a tool call with `<EMAIL>` as the address.
-
-So the flow is:
-
-    ingress  (user msg, RAG snippets, tool results)  -> redact  -> model sees ⟦PII_EMAIL_1⟧
-    egress   (tool arguments, just before dispatch)  -> rehydrate -> tool sees the real value
-
-The hosted model therefore never sees the real value, and the tool never sees a
-placeholder. Confirmation cards show the REHYDRATED values -- the entire point
-of human review is seeing what will actually happen.
-
-Patterns are imported from the pipeline scrubber: one implementation, tested
-once, so the two can never drift.
-"""
+"""Reversible PII vault for the runtime path."""
 
 from __future__ import annotations
 
@@ -30,9 +13,7 @@ from mehullm.pipeline.pii import _ORDER, PATTERNS
 
 TOKEN_RE = re.compile(r"⟦PII_[A-Z]+_\d+⟧")
 
-# Credentials that must be hard-redacted, never vaulted. A Gmail body or a
-# GitHub file can contain a live key; putting it in a reversible vault would
-# hand it straight back out on the next tool call.
+# Credentials that must be hard-redacted, never vaulted. A Gmail body or a.
 SECRET_RES: list[tuple[str, regex.Pattern]] = [
     ("openai_key", regex.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
     ("github_pat", regex.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
@@ -48,8 +29,8 @@ SECRET_RES: list[tuple[str, regex.Pattern]] = [
 class Vault:
     """Per-run placeholder store. Lives and dies with the Run."""
 
-    fwd: dict[str, str] = field(default_factory=dict)   # real -> token
-    rev: dict[str, str] = field(default_factory=dict)   # token -> real
+    fwd: dict[str, str] = field(default_factory=dict)  # real -> token
+    rev: dict[str, str] = field(default_factory=dict)  # token -> real
     counts: Counter[str] = field(default_factory=Counter)
     secrets_found: Counter[str] = field(default_factory=Counter)
 

@@ -1,10 +1,4 @@
-"""Hybrid retrieval: BM25 (FTS5) + dense (sqlite-vec), fused with RRF (k=60).
-
-RRF rather than score-normalisation: the two scales are incomparable.
-
-Recency applies to FACTS ONLY -- style exemplars are sampled uniformly across
-years, or the voice tracks last month's mood. No reranker in the hot path.
-"""
+"""Hybrid retrieval: BM25 (FTS5) + dense (sqlite-vec), fused with RRF (k=60)."""
 
 from __future__ import annotations
 
@@ -24,7 +18,7 @@ FACT_HALFLIFE_DAYS = 180.0
 class Hit:
     id: int
     text: str
-    kind: str            # 'fact' | 'style' | 'doc'
+    kind: str  # 'fact' | 'style' | 'doc'
     score: float
     bm25_rank: int | None = None
     dense_rank: int | None = None
@@ -32,18 +26,139 @@ class Hit:
     meta: dict | None = None
 
 
-# Stripped from FTS queries. Not for tidiness -- an OR query over stopwords
-# manufactures lexical matches that carry no information, and RRF then rewards
-# those documents for appearing in BOTH lists. Observed: "where do I live"
-# matched every first-person fact on the token "I", which outranked
-# "Mehul lives in Hyderabad" (third person, no "I") badly enough to push the
-# correct answer out of the top 8 entirely.
-_STOPWORDS = frozenset(["a", "an", "the", "is", "am", "are", "was", "were", "be", "been", "being", "do", "does", "did", "doing", "have", "has", "had", "having", "i", "me", "my", "mine", "myself", "you", "your", "yours", "we", "us", "our", "ours", "they", "them", "their", "he", "him", "his", "she", "her", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom", "whose", "where", "when", "why", "how", "of", "in", "on", "at", "to", "for", "with", "from", "by", "about", "as", "into", "over", "after", "before", "and", "or", "but", "if", "so", "than", "then", "there", "here", "can", "could", "will", "would", "shall", "should", "may", "might", "must", "not", "no", "nor", "too", "very", "just", "also", "again", "once", "mera", "meri", "mere", "main", "mujhe", "hai", "hain", "tha", "the", "ka", "ki", "ke", "ko", "se", "par", "kya", "kaun", "kaha", "kab", "kyu", "kyun", "kaise", "hu", "ho", "hoon", "me", "aur", "ya"])
+# Stripped from FTS queries. Not for tidiness -- an OR query over stopwords.
+_STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "is",
+        "am",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "do",
+        "does",
+        "did",
+        "doing",
+        "have",
+        "has",
+        "had",
+        "having",
+        "i",
+        "me",
+        "my",
+        "mine",
+        "myself",
+        "you",
+        "your",
+        "yours",
+        "we",
+        "us",
+        "our",
+        "ours",
+        "they",
+        "them",
+        "their",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "where",
+        "when",
+        "why",
+        "how",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "with",
+        "from",
+        "by",
+        "about",
+        "as",
+        "into",
+        "over",
+        "after",
+        "before",
+        "and",
+        "or",
+        "but",
+        "if",
+        "so",
+        "than",
+        "then",
+        "there",
+        "here",
+        "can",
+        "could",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "must",
+        "not",
+        "no",
+        "nor",
+        "too",
+        "very",
+        "just",
+        "also",
+        "again",
+        "once",
+        "mera",
+        "meri",
+        "mere",
+        "main",
+        "mujhe",
+        "hai",
+        "hain",
+        "tha",
+        "the",
+        "ka",
+        "ki",
+        "ke",
+        "ko",
+        "se",
+        "par",
+        "kya",
+        "kaun",
+        "kaha",
+        "kab",
+        "kyu",
+        "kyun",
+        "kaise",
+        "hu",
+        "ho",
+        "hoon",
+        "me",
+        "aur",
+        "ya",
+    ]
+)
 
 
 def _fts_query(text: str) -> str:
-    """FTS5 MATCH is a query language, not a literal -- unescaped user text with
-    a quote or an operator raises OperationalError mid-request."""
+    """FTS5 MATCH is a query language, not a literal -- unescaped user text with a quote or an operator raises Operat."""
     raw = "".join(c if c.isalnum() or c.isspace() else " " for c in text).split()
     words = [w for w in raw if w.casefold() not in _STOPWORDS]
     # An all-stopword query ("how are you") should retrieve on meaning alone
@@ -53,13 +168,6 @@ def _fts_query(text: str) -> str:
 
 # FTS5 DOES NOT RANK BY DEFAULT.
 #
-# Without an explicit `ORDER BY rank`, SQLite returns matching rows in ROWID
-# order, so `LIMIT 50` silently returns the first 50 chunks in the table --
-# the SAME rows for every query. Observed directly: two unrelated queries both
-# returned ids [5, 10, 11, 16, 19], and lexical/dense overlap was exactly zero
-# because one half of the hybrid retriever was constant.
-#
-# `rank` is BM25 (negative; more negative = better), so ORDER BY rank ASC.
 _ORDER_BY_RANK = "ORDER BY rank"
 
 
@@ -67,11 +175,7 @@ def _rrf(rank: int) -> float:
     return 1.0 / (RRF_K + rank)
 
 
-# Formatting instructions are addressed to the MODEL, not to memory, and they
-# drag the query embedding away from the question. Observed: "what sports do I
-# play" ranked the right fact 3rd, while "what sports do I play? one line."
-# pushed it out of the top 8 entirely and the agent answered "you don't play
-# any sports".
+# Formatting instructions are addressed to the MODEL, not to memory, and they.
 _INSTRUCTION_TAIL = re.compile(
     r"[\s,.;–—-]*\b(?:"
     r"one line|in one line|keep it short|keep it brief|be brief|briefly|"
@@ -108,9 +212,16 @@ def search_facts(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
             )
         ):
             scores[row["id"]] = Hit(
-                row["id"], row["text"], "fact", _rrf(rank), bm25_rank=rank,
-                meta={"confidence": row["confidence"], "observed_at": row["observed_at"],
-                      "predicate": row["predicate"]},
+                row["id"],
+                row["text"],
+                "fact",
+                _rrf(rank),
+                bm25_rank=rank,
+                meta={
+                    "confidence": row["confidence"],
+                    "observed_at": row["observed_at"],
+                    "predicate": row["predicate"],
+                },
             )
 
     vec = embed_query(query)
@@ -128,9 +239,16 @@ def search_facts(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
             h.dense_rank = rank
         else:
             scores[row["id"]] = Hit(
-                row["id"], row["text"], "fact", _rrf(rank), dense_rank=rank,
-                meta={"confidence": row["confidence"], "observed_at": row["observed_at"],
-                      "predicate": row["predicate"]},
+                row["id"],
+                row["text"],
+                "fact",
+                _rrf(rank),
+                dense_rank=rank,
+                meta={
+                    "confidence": row["confidence"],
+                    "observed_at": row["observed_at"],
+                    "predicate": row["predicate"],
+                },
             )
 
     now = time.time()
@@ -185,22 +303,15 @@ def search_style(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
             h.score += _rrf(rank)
             h.dense_rank = rank
         else:
-            scores[row["id"]] = Hit(row["id"], row["text"], row["kind"], _rrf(rank), dense_rank=rank)
+            scores[row["id"]] = Hit(
+                row["id"], row["text"], row["kind"], _rrf(rank), dense_rank=rank
+            )
 
     return sorted(scores.values(), key=lambda h: -h.score)[:k]
 
 
 def render_memory_block(hits: list[Hit]) -> str:
-    """Fact ids are load-bearing: they let a trace show WHICH fact drove an
-    answer, and make factual recall deterministically gradeable.
-
-    The PREDICATE is rendered alongside because a hand-written bank contains
-    fragments, not just sentences. Asked "what sports do I play", the model was
-    handed `[F311] Swimming and Cricket`, could not tell what the relation was,
-    and answered "you don't play any sports" -- while happily using the
-    neighbouring fact that happened to be a full sentence. `[F311 · plays]`
-    restores the relation without anyone rewriting their notes.
-    """
+    """Fact ids are load-bearing: they let a trace show WHICH fact drove an answer, and make factual recall determini."""
     lines = []
     for h in hits:
         meta = h.meta or {}

@@ -1,25 +1,10 @@
-"""JSON Schema -> Gemini's OpenAPI subset.
-
-LOAD-BEARING. MCP servers emit Pydantic/zod-generated schemas full of `$ref`
-(nested models), `anyOf` (every optional field becomes
-`{"anyOf":[{...},{"type":"null"}]}`), `additionalProperties`, and `format`
-keywords. Gemini rejects all four. Unsanitised, essentially every non-trivial
-MCP tool 400s at registration.
-
-Two rules that came out of getting this wrong:
-
-* An object with empty `properties` is rejected. For a zero-arg tool, OMIT
-  `parameters` entirely rather than sending `{}`.
-* Degrade loudly. `sanitize()` records what it dropped so the caller can log a
-  diff -- silent type-widening is how you get a tool that is registered but
-  never callable, with no error anywhere.
-"""
+"""JSON Schema -> Gemini's OpenAPI subset."""
 
 from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["sanitize", "sanitize_with_notes", "needs_parameters"]
+__all__ = ["needs_parameters", "sanitize", "sanitize_with_notes"]
 
 # Keys Gemini understands. Anything else is dropped.
 _ALLOWED = {"type", "description", "properties", "required", "items", "enum", "nullable"}
@@ -40,9 +25,7 @@ def sanitize_with_notes(schema: dict[str, Any]) -> tuple[dict[str, Any], list[st
     return _walk(schema, defs, 0, notes, path="$"), notes
 
 
-def _walk(
-    node: Any, defs: dict, depth: int, notes: list[str], path: str
-) -> dict[str, Any]:
+def _walk(node: Any, defs: dict, depth: int, notes: list[str], path: str) -> dict[str, Any]:
     if not isinstance(node, dict):
         return {"type": "string"}
 
@@ -88,9 +71,7 @@ def _walk(
         if k in ("$defs", "definitions"):
             continue
         if k == "properties" and isinstance(v, dict):
-            out[k] = {
-                pk: _walk(pv, defs, depth + 1, notes, f"{path}.{pk}") for pk, pv in v.items()
-            }
+            out[k] = {pk: _walk(pv, defs, depth + 1, notes, f"{path}.{pk}") for pk, pv in v.items()}
         elif k == "items":
             out[k] = _walk(v, defs, depth + 1, notes, f"{path}[]")
         elif k in _ALLOWED:
@@ -115,9 +96,5 @@ def _walk(
 
 
 def needs_parameters(schema: dict[str, Any] | None) -> bool:
-    """False for zero-arg tools.
-
-    Gemini rejects `parameters: {type: object, properties: {}}`. The correct
-    encoding for a tool that takes no arguments is to omit `parameters` entirely.
-    """
+    """False for zero-arg tools."""
     return bool(schema and schema.get("properties"))

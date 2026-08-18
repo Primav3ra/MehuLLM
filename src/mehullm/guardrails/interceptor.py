@@ -1,16 +1,4 @@
-"""The single choke point for every tool call.
-
-There is no second way to call a tool. Kill switch, policy, rate limits,
-confirmation, PII rehydration, secret scanning and truncation all live on this
-one path, in this order.
-
-The confirmation protocol is the subtle part: the loop registers a Future and
-awaits it, while the decision arrives on a completely different HTTP request
-(POST /chat/{id}/confirm) which resolves that Future. A timeout resolves as
-DENY, and the resulting tool result says so plainly -- the system prompt tells
-the model denial is a normal outcome, so it explains and offers an alternative
-instead of retry-looping.
-"""
+"""The single choke point for every tool call."""
 
 from __future__ import annotations
 
@@ -26,6 +14,10 @@ from mehullm.guardrails.policy import Policy
 from mehullm.llm.types import ToolCall
 from mehullm.mcp.hub import MCPHub
 from mehullm.mcp.registry import Registry
+from mehullm.obs import get_logger
+from mehullm.persistence import tracing
+
+log = get_logger(__name__)
 
 PREVIEW = 400
 
@@ -40,8 +32,7 @@ class ToolOutcome:
 
 @dataclass
 class _LocalResult:
-    """Shapes a local-tool return like an MCPHub ToolResult so the rest of the
-    interceptor is identical for both."""
+    """Shapes a local-tool return like an MCPHub ToolResult so the rest of the interceptor is identical for both."""
 
     text: str
     is_error: bool = False
@@ -75,6 +66,10 @@ class Interceptor:
         self.local_tools = local_tools
 
     async def execute(self, run: Run, call: ToolCall) -> ToolOutcome:
+        with tracing.span("tool", "tool_call", tool=call.name) as sp:
+            return await self._execute(run, call, sp)
+
+    async def _execute(self, run: Run, call: ToolCall, sp: Any) -> ToolOutcome:
         started = time.monotonic()
 
         def err(msg: str) -> ToolOutcome:
@@ -88,8 +83,15 @@ class Interceptor:
 
         ref = self.registry.resolve(call.name)
         if ref is None:
-            # Never split the model's string -- always dict-lookup. An unknown
-            # name is a normal recoverable outcome, not an exception.
+            # Never split the model's string -- always dict-lookup.
+            known = sorted(d.name for d in self.registry.tool_defs())
+            sp.status, sp.error = "error", f"unknown tool {call.name}"
+            log.warning(
+                "tool.unknown",
+                tool=call.name,
+                registered=len(known),
+                servers=sorted({k.split("__")[0] for k in known}),
+            )
             return err(f"Unknown tool {call.name!r}. Use one of the tools provided.")
 
         verdict = self.policy.evaluate(
@@ -115,44 +117,58 @@ class Interceptor:
         # human review is seeing the real values that will actually be sent.
         args = run.vault.rehydrate(call.args)
 
-        if verdict.action == "confirm" and _key(ref.server_id, ref.tool_name) not in run.session_grants:
-            decision = await self._confirm(run, call, ref, verdict, args)
+        if (
+            verdict.action == "confirm"
+            and _key(ref.server_id, ref.tool_name) not in run.session_grants
+        ):
+            with tracing.span("confirm", "guardrail", tool=call.name) as csp:
+                decision = await self._confirm(run, call, ref, verdict, args)
+                csp.attrs.update(decision=decision.approved, by=decision.by)
             if not decision.approved:
-                await run.emit(
-                    ev.confirmation_resolved(decision.reason or "", "deny", decision.by)
-                )
+                await run.emit(ev.confirmation_resolved(decision.reason or "", "deny", decision.by))
                 return err(
                     f"The user declined this action. {decision.reason} "
                     "Do not attempt it via another tool."
                 )
 
         await run.emit(
-            ev.tool_start(
-                call.id, call.name, ref.server_id, verdict.risk, _preview(call.args)
-            )
+            ev.tool_start(call.id, call.name, ref.server_id, verdict.risk, _preview(call.args))
         )
 
-        if ref.server_id == "local" and self.local_tools is not None:
-            text_out, is_err = await self.local_tools.call(call.name, args)
-            result = _LocalResult(text_out, is_err)
-        else:
-            result = await self.hub.call(ref, args)
+        with tracing.span("dispatch", "tool_call", server=ref.server_id) as dsp:
+            if ref.server_id == "local" and self.local_tools is not None:
+                text_out, is_err = await self.local_tools.call(call.name, args)
+                result = _LocalResult(text_out, is_err)
+            else:
+                result = await self.hub.call(ref, args)
+            dsp.attrs["is_error"] = result.is_error
 
         text, secrets = run.vault.scrub_secrets(result.text)
         if secrets:
             await run.emit(
                 ev.guardrail_blocked(
-                    "secret-scan", "secret_scan",
-                    f"redacted {', '.join(secrets)} from tool output", call.name,
+                    "secret-scan",
+                    "secret_scan",
+                    f"redacted {', '.join(secrets)} from tool output",
+                    call.name,
                 )
             )
         text = run.vault.redact(text)
         run.provenance.add(ref.server_id)
 
         ms = int((time.monotonic() - started) * 1000)
+        sp.output_text = text[:PREVIEW]
+        sp.attrs.update(server=ref.server_id, risk=verdict.risk, ok=not result.is_error)
         await run.emit(
-            ev.tool_result(call.id, call.name, not result.is_error, ms,
-                           text[:PREVIEW], result.bytes_, result.truncated)
+            ev.tool_result(
+                call.id,
+                call.name,
+                not result.is_error,
+                ms,
+                text[:PREVIEW],
+                result.bytes_,
+                result.truncated,
+            )
         )
         return ToolOutcome(call.id, call.name, text, result.is_error)
 

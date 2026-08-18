@@ -1,12 +1,4 @@
-"""Voice layer + fact-invariant firewall.
-
-A 1.7B model rewriting for style WILL occasionally drop a digit or mangle a URL.
-So every number, URL, email, @handle, date and quoted string in the draft must
-survive into the voiced output, or the draft is used instead.
-
-This is a concrete hallucination firewall at a system boundary, and it is the
-reason it is safe to let a small local model touch the user-facing answer at all.
-"""
+"""Voice layer + fact-invariant firewall."""
 
 from __future__ import annotations
 
@@ -18,11 +10,14 @@ import regex
 from mehullm.voice.client import OllamaClient
 
 _INVARIANTS = [
+    # Fact citations, FIRST because they are what makes an answer auditable.
+    regex.compile(r"\[F\d+\]"),
     regex.compile(r"https?://\S+"),
     regex.compile(r"\b[\w.\-+]+@[\w\-]+\.\w{2,}\b"),
     regex.compile(r"@[A-Za-z0-9_\-]{2,}"),
     regex.compile(r"⟦PII_[A-Z]+_\d+⟧"),
-    regex.compile(r"\d+(?:[.,]\d+)*"),
+    # ':' belongs in the separator class. Without it "4:30" decomposed into the.
+    regex.compile(r"\d+(?:[.,:]\d+)*"),
     regex.compile(r"\"[^\"]{3,}\""),
 ]
 
@@ -36,21 +31,34 @@ def extract_invariants(text: str) -> set[str]:
     return out
 
 
+def voice_if_available(host: str, model: str) -> VoiceRewriter | None:
+    """None when ollama is down or the model is not installed -- both are normal states, neither is fatal."""
+    from mehullm.voice.client import OllamaClient
+
+    try:
+        if OllamaClient(model=model, host=host).has_model():
+            return VoiceRewriter(host=host, model=model)
+    except Exception:
+        return None
+    return None
+
+
 @dataclass
 class VoiceRewriter:
     host: str = "http://localhost:11434"
     model: str = "mehul-voice"
+    # LEAVE THIS EMPTY. Measured on v1: populating it inverts person and copies.
     context: str = ""
 
+    # 0.3, not the 0.85 the plan guessed before there was a model to measure.
+    temperature: float = 0.3
+
     async def rewrite(self, draft: str) -> tuple[str, bool]:
-        """Returns (text, ok). ok=False means the invariant check failed and the
-        caller should fall back to the draft."""
+        """Returns (text, ok)."""
         client = OllamaClient(model=self.model, host=self.host, num_ctx=2048)
-        prompt = (
-            f"<context>\n{self.context}\n</context>\n<draft>\n{draft.strip()}\n</draft>"
-        )
+        prompt = f"<context>\n{self.context}\n</context>\n<draft>\n{draft.strip()}\n</draft>"
         voiced = await asyncio.to_thread(
-            client.generate, prompt, temperature=0.85, num_predict=200
+            client.generate, prompt, temperature=self.temperature, num_predict=200
         )
         voiced = (voiced or "").strip()
         if not voiced:
