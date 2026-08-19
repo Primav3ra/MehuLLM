@@ -14,7 +14,7 @@ from typing import Any
 from mehullm.agent.run_manager import RunManager
 from mehullm.eval.bank import Scenario, seed_db
 from mehullm.eval.graders import AssertionResult, Transcript, run_assertions
-from mehullm.memory.retrieve import Hit, render_memory_block
+from mehullm.memory.retrieve import Hit, asks_about_past, render_memory_block
 from mehullm.persistence import tracing
 from mehullm.settings import settings
 
@@ -195,9 +195,22 @@ class BankRunner:
         if warmup := getattr(self.loop_factory, "warmup", None):
             report = await warmup()
             print(f"  mcp: {report}")
+        # Append as we go: a batch write at the end loses every result if the
+        # process stalls on the last scenario.
+        live = self.scratch_dir / "results.jsonl"
+        live.unlink(missing_ok=True)
         for s in scenarios:
             r = await self.run_one(s)
             rep.results.append(r)
+            with live.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "id": s.id, "category": s.category, "weight": s.weight,
+                    "passed": r.passed, "failures": r.failures,
+                    "latency_ms": r.transcript.latency_ms,
+                    "steps": r.transcript.steps,
+                    "tools": r.transcript.tools_called,
+                    "output": r.transcript.final_text[:500],
+                }) + chr(10))
             if on_result:
                 on_result(r)
         rep.elapsed_s = time.monotonic() - t0
@@ -208,6 +221,9 @@ def _memory_block(s: Scenario) -> str:
     """Render seeded facts through the PRODUCTION renderer."""
     if not s.seed_facts:
         return ""
+    # Mirror production: superseded facts are shown only when the prompt asks
+    # about the past, marked PAST so they cannot read as current.
+    past = asks_about_past(s.prompt)
     hits = [
         Hit(
             id=int(str(f["id"]).lstrip("F")),
@@ -218,10 +234,11 @@ def _memory_block(s: Scenario) -> str:
                 "confidence": float(f.get("confidence", 0.9)),
                 "observed_at": f.get("observed_at"),
                 "predicate": f.get("predicate", ""),
+                "past": f.get("status", "active") == "superseded",
             },
         )
         for f in s.seed_facts
-        if f.get("status", "active") == "active"
+        if f.get("status", "active") == "active" or past
     ]
     return render_memory_block(hits) if hits else ""
 

@@ -15,6 +15,10 @@ writing style before he sees it. Because of that:
 
 GUARDRAIL_CONTRACT = """Some tools require Mehul's explicit confirmation before they run.
 
+Do NOT ask for permission yourself and do NOT stop short of calling the tool. Call
+it; the system pauses and shows Mehul a card. Asking in prose instead bypasses
+that gate, so nothing is recorded and nothing is actually approved.
+
 A denial is a normal, expected outcome -- NOT an error. When an action is denied:
 explain what you wanted to do and why, then offer an alternative. Never attempt \
 to accomplish a denied action through a different tool."""

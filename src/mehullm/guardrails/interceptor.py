@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -16,9 +17,11 @@ from mehullm.mcp.hub import MCPHub
 from mehullm.mcp.registry import Registry
 from mehullm.obs import get_logger
 from mehullm.persistence import tracing
+from mehullm.settings import settings
 
 log = get_logger(__name__)
 
+REPEAT_NOTE = "\n\n[Already called with these arguments this turn.]"
 PREVIEW = 400
 
 
@@ -116,6 +119,7 @@ class Interceptor:
         # Rehydrate BEFORE showing the confirmation card: the whole point of
         # human review is seeing the real values that will actually be sent.
         args = run.vault.rehydrate(call.args)
+        args = _with_defaults(ref.server_id, args)
 
         if (
             verdict.action == "confirm"
@@ -125,7 +129,7 @@ class Interceptor:
                 decision = await self._confirm(run, call, ref, verdict, args)
                 csp.attrs.update(decision=decision.approved, by=decision.by)
             if not decision.approved:
-                await run.emit(ev.confirmation_resolved(decision.reason or "", "deny", decision.by))
+                # _confirm already emitted the real confirmation_resolved.
                 return err(
                     f"The user declined this action. {decision.reason} "
                     "Do not attempt it via another tool."
@@ -134,6 +138,18 @@ class Interceptor:
         await run.emit(
             ev.tool_start(call.id, call.name, ref.server_id, verdict.risk, _preview(call.args))
         )
+
+        # Identical call, same turn: return the first result instead of paying for
+        # it again. Observed: local__memory_search called 8x in a row.
+        memo = _memo_key(call.name, args)
+        if (prior := run.tool_memo.get(memo)) is not None:
+            log.info("tool.repeat", tool=call.name)
+            sp.attrs["repeat"] = True
+            text = prior + REPEAT_NOTE
+            await run.emit(
+                ev.tool_result(call.id, call.name, True, 0, text[:PREVIEW], len(text), False)
+            )
+            return ToolOutcome(call.id, call.name, text, False)
 
         with tracing.span("dispatch", "tool_call", server=ref.server_id) as dsp:
             if ref.server_id == "local" and self.local_tools is not None:
@@ -155,6 +171,8 @@ class Interceptor:
             )
         text = run.vault.redact(text)
         run.provenance.add(ref.server_id)
+
+        run.tool_memo[memo] = text
 
         ms = int((time.monotonic() - started) * 1000)
         sp.output_text = text[:PREVIEW]
@@ -201,6 +219,18 @@ class Interceptor:
             ev.confirmation_resolved(iid, "approve" if decision.approved else "deny", decision.by)
         )
         return decision
+
+
+def _with_defaults(server_id: str, args: dict) -> dict:
+    """Bind account identity the model cannot know. Left to guess, it fabricates
+    plausible addresses like mehulkarwa@gmail.com."""
+    if server_id != "gmail" or not settings.gmail_account:
+        return args
+    return {**args, "user_google_email": settings.gmail_account}
+
+
+def _memo_key(name: str, args: dict) -> str:
+    return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
 
 
 def _key(server: str, tool: str) -> str:

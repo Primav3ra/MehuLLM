@@ -8,7 +8,7 @@ from typing import Any
 
 from mehullm.agent.loop import AgentLoop, LoopConfig
 from mehullm.eval.bank import Scenario
-from mehullm.mcp.hub import load_server_specs
+from mehullm.mcp.hub import MAX_RESULT_CHARS, ToolResult, load_server_specs
 from mehullm.mcp.registry import glob_match as _glob
 
 CONFIG_DIR = Path("config")
@@ -25,17 +25,27 @@ class _InjectingHub:
         return getattr(self._inner, item)
 
     async def call(self, ref: Any, args: dict[str, Any], timeout: float | None = None):
+        """Injected results must be ToolResult, like the real hub returns.
+
+        A bare str made the interceptor raise "'str' object has no attribute
+        is_error", and raising for inject.error killed the turn -- so every
+        injection scenario failed on contact instead of exercising the guardrail.
+        """
         name = getattr(ref, "namespaced", None) or getattr(ref, "name", "")
         want = self._inject.get("tool")
-        if want and _glob(want, name):
-            if "error" in self._inject:
-                raise RuntimeError(self._inject["error"])
-            if "result_bytes" in self._inject:
-                # Oversized-result scenario: the 32 KB truncation in the.
-                n = int(self._inject["result_bytes"])
-                return "Subject: mail\n" * (n // 14)
-            return self._inject.get("result", "")
-        return await self._inner.call(ref, args, timeout=timeout)
+        if not (want and _glob(want, name)):
+            return await self._inner.call(ref, args, timeout=timeout)
+
+        if "error" in self._inject:
+            msg = str(self._inject["error"])
+            return ToolResult(msg, is_error=True, bytes_=len(msg))
+        if "result_bytes" in self._inject:
+            n = int(self._inject["result_bytes"])
+            full = "Subject: mail\n" * (n // 14)
+            return ToolResult(full[:MAX_RESULT_CHARS], bytes_=len(full),
+                              truncated=len(full) > MAX_RESULT_CHARS)
+        out = str(self._inject.get("result", ""))
+        return ToolResult(out, bytes_=len(out))
 
 
 def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None], AgentLoop]:

@@ -74,6 +74,19 @@ def _walk(node: Any, defs: dict, depth: int, notes: list[str], path: str) -> dic
             out[k] = {pk: _walk(pv, defs, depth + 1, notes, f"{path}.{pk}") for pk, pv in v.items()}
         elif k == "items":
             out[k] = _walk(v, defs, depth + 1, notes, f"{path}[]")
+        elif k == "type" and isinstance(v, list):
+            # JSON Schema allows type as a list; Gemini wants one scalar.
+            real = [x for x in v if x != "null"]
+            out[k] = real[0] if real else "string"
+            if len(v) > len(real):
+                out["nullable"] = True
+            if len(real) > 1:
+                notes.append(f"{path}: type {v} narrowed to {out[k]}")
+        elif k == "enum":
+            # Gemini rejects non-string enum members (github issue_write ships a
+            # boolean), and an enum only applies to a string type.
+            out[k] = [str(x) for x in v] if isinstance(v, list) else v
+            out.setdefault("type", "string")
         elif k in _ALLOWED:
             out[k] = v
         elif k == "format":

@@ -196,6 +196,43 @@ def _clean_query(text: str) -> str:
     return out or text.strip()
 
 
+_HISTORY_CUE = re.compile(
+    r"\b(?:used to|use to|before that|previously|earlier|formerly|"
+    r"in the past|old|former|pehle|pehele)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_about_past(query: str) -> bool:
+    return bool(_HISTORY_CUE.search(query))
+
+
+def _superseded(store: MemoryStore, query: str, k: int) -> list[Hit]:
+    """Past values, by keyword only. Answers "where did I live before?" -- which is
+    unanswerable otherwise, and the model invents a city instead."""
+    q = _fts_query(query)
+    if not q:
+        return []
+    rows = store.conn().execute(
+        "SELECT f.id, f.text, f.confidence, f.observed_at, f.predicate FROM facts_fts"
+        " JOIN facts f ON f.id = facts_fts.rowid"
+        f" WHERE facts_fts MATCH ? AND f.status='superseded' {_ORDER_BY_RANK} LIMIT ?",
+        (q, k),
+    )
+    return [
+        Hit(
+            r["id"], r["text"], "fact", 0.0, bm25_rank=i,
+            meta={
+                "confidence": r["confidence"],
+                "observed_at": r["observed_at"],
+                "predicate": r["predicate"],
+                "past": True,
+            },
+        )
+        for i, r in enumerate(rows)
+    ]
+
+
 def search_facts(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
     c = store.conn()
     scores: dict[int, Hit] = {}
@@ -259,7 +296,11 @@ def search_facts(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
             h.recency = 1.0 + 0.5 * math.exp(-age_days / FACT_HALFLIFE_DAYS)
             h.score *= h.recency
 
-    return sorted(scores.values(), key=lambda h: -h.score)[:k]
+    out = sorted(scores.values(), key=lambda h: -h.score)[:k]
+    if asks_about_past(query):
+        seen = {h.id for h in out}
+        out += [h for h in _superseded(store, query, 3) if h.id not in seen]
+    return out
 
 
 def search_style(store: MemoryStore, query: str, k: int = 8) -> list[Hit]:
@@ -317,9 +358,10 @@ def render_memory_block(hits: list[Hit]) -> str:
         meta = h.meta or {}
         pred = str(meta.get("predicate") or "").replace("_", " ").strip()
         tag = f" · {pred}" if pred else ""
+        past = " · PAST" if meta.get("past") else ""
         when = ""
         if meta.get("observed_at"):
             when = " · " + time.strftime("%Y-%m-%d", time.localtime(float(meta["observed_at"])))
         conf = f" · conf {meta.get('confidence', 0):.1f}" if meta.get("confidence") else ""
-        lines.append(f"[F{h.id}{tag}{when}{conf}] {h.text}")
+        lines.append(f"[F{h.id}{tag}{past}{when}{conf}] {h.text}")
     return "\n".join(lines)

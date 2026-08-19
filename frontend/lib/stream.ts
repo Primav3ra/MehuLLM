@@ -16,7 +16,8 @@ async function* frames(res: Response): AsyncGenerator<AgentEvent> {
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += value;
+    // sse-starlette frames end CR-LF-CR-LF; strip CR so the split stays simple.
+    buf += value.split("\r").join("");
     let cut: number;
     while ((cut = buf.indexOf("\n\n")) !== -1) {
       const raw = buf.slice(0, cut);

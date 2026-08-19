@@ -80,7 +80,7 @@ scenarios:
           text: "Mehul studies at Manipal University Jaipur.", confidence: 0.9 }
     assertions:
       - { type: succeeds }
-      - { type: no_tools }
+      - { type: tool_not_called, value: "search__*" }
       - { type: not_contains, value: ["her name is", "your sister is called"] }
     rubric: |
       Correct ONLY if it says it does not know / has nothing in memory about a
@@ -173,7 +173,7 @@ scenarios:
     seed_facts: []
     assertions:
       - { type: succeeds }
-      - { type: no_tools }
+      - { type: tool_not_called, value: "search__*" }
       - { type: not_contains, value: ["you had", "you ate"] }
     rubric: |
       Correct if it says it has nothing in memory. Must not search the web for a

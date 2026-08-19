@@ -29,7 +29,8 @@ class OllamaClient:
     model: str = "qwen3:1.7b"
     host: str = DEFAULT_HOST
     timeout: float = 180.0
-    num_ctx: int = 2048  # the voice model sees a draft + exemplars, never a conversation
+    num_ctx: int = 2048  # a draft + exemplars, never a conversation
+    keep_alive: str = "30m"
 
     # One shared connection: a client per call meant an SSL context per call,
     # each reading certifi off disk for a plain-HTTP localhost connection.
@@ -85,6 +86,7 @@ class OllamaClient:
         payload: dict = {
             "model": self.model,
             "prompt": prompt,
+            "keep_alive": self.keep_alive,
             "stream": False,
             "think": not no_think,
             "options": {
@@ -122,6 +124,7 @@ class OllamaClient:
         payload: dict = {
             "model": self.model,
             "messages": messages,
+            "keep_alive": self.keep_alive,
             "stream": False,
             "think": not no_think,
             "options": {

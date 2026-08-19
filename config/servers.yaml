@@ -13,8 +13,7 @@ servers:
         - search_repositories
         - get_file_contents
         - list_issues
-        - list_notifications
-        - create_issue
+        - issue_write
     timeout_s: 30
 
   # No key, no signup. Tavily is a drop-in swap if quality disappoints.

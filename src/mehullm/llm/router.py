@@ -128,7 +128,7 @@ class LLMRouter:
         system: str,
         messages: list[Msg],
         tools: list[ToolDef],
-        max_tokens: int = 4096,
+        max_tokens: int = 1024,
     ) -> AsyncIterator[LLMEvent]:
         """Stream from the best available provider, failing over on the way."""
         tried: set[str] = set()
@@ -149,6 +149,7 @@ class LLMRouter:
             buffered: list[LLMEvent] = []
             usage_in = usage_out = 0
             t_start = time.monotonic()
+            stream_ms = 0
             # Accounting MUST happen in a finally. This is an async generator and.
             recorded = False
             try:
@@ -166,6 +167,8 @@ class LLMRouter:
                                 usage_in += ev.usage.input_tokens
                                 usage_out += ev.usage.output_tokens
                             buffered.append(ev)
+                            if isinstance(ev, StreamEnd):
+                                stream_ms = int((time.monotonic() - t0) * 1000)
                             yield ev
                             if isinstance(ev, StreamEnd):
                                 break
@@ -207,7 +210,7 @@ class LLMRouter:
                 tracing.record_span(
                     "llm",
                     "llm_call",
-                    int((time.monotonic() - t_start) * 1000),
+                    stream_ms or int((time.monotonic() - t_start) * 1000),
                     provider=name,
                     model=provider.client.model,
                     tokens_in=usage_in,

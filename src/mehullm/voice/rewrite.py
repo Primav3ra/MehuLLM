@@ -58,7 +58,7 @@ class VoiceRewriter:
         client = OllamaClient(model=self.model, host=self.host, num_ctx=2048)
         prompt = f"<context>\n{self.context}\n</context>\n<draft>\n{draft.strip()}\n</draft>"
         voiced = await asyncio.to_thread(
-            client.generate, prompt, temperature=self.temperature, num_predict=200
+            client.generate, prompt, temperature=self.temperature, num_predict=120
         )
         voiced = (voiced or "").strip()
         if not voiced:

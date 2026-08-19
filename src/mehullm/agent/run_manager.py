@@ -44,6 +44,7 @@ class Run:
     status: str = "running"
     final_text: str = ""
     error: str = ""
+    tool_memo: dict[str, str] = field(default_factory=dict)
 
     async def emit(self, ev: Event) -> None:
         self.seq += 1

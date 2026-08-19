@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # the quota store LEARNS the real ceiling from 429s rather than trusting this.
     gemini_rpd_guess: int = 200
 
+    # workspace-mcp requires user_google_email even with --single-user, and the
+    # model invents addresses when it is not told one.
+    gmail_account: str = ""
+
     ollama_host: str = "http://localhost:11434"
     ollama_voice_model: str = "mehul-voice"
     ollama_base_model: str = "qwen3:1.7b"
@@ -37,7 +41,8 @@ class Settings(BaseSettings):
 
     mehullm_api_token: str = ""
     mehullm_host: str = "127.0.0.1"
-    mehullm_port: int = 8000
+    # NOT 8000: workspace-mcp's OAuth callback server owns that port.
+    mehullm_port: int = 8010
     mehullm_cors_origins: str = "http://localhost:3000"
 
     mehullm_db: str = str(ROOT / "data" / "derived" / "mehullm.db")

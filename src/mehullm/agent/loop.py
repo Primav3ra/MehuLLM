@@ -35,7 +35,7 @@ class LoopConfig:
     max_steps: int = 12
     max_turn_seconds: int = 180
     max_tool_calls_per_turn: int = 25
-    max_tokens: int = 4096
+    max_tokens: int = 1024
     voice_enabled: bool = True
 
 
@@ -177,6 +177,14 @@ class AgentLoop:
                     )
                 )
 
+            if not final_text.strip():
+                # A guard broke the loop after a tool step, so no answer was
+                # generated. Say so rather than returning an empty turn.
+                final_text = (
+                    "I ran out of time on this one before I could finish. "
+                    "Ask me again, or narrow the question."
+                )
+                log.warning("turn.no_answer", steps=step)
             final_text = await self._voice(run, final_text)
             run.status = "ok"
 

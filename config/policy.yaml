@@ -37,7 +37,7 @@ tiers:
 
   # --- T2: irreversible or externally visible ---
   "gmail__send*": T2
-  "github__create_issue": T2     # public on the repo, so externally visible
+  "github__issue_write": T2      # public on the repo, so externally visible
   "github__merge_*": T2
   "github__create_pull_request": T2
   "market__*": T2          # metered free tier -- ~25 req/day
