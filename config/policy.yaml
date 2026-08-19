@@ -22,23 +22,22 @@ tiers:
   "github__list_*": T0
   "github__get_*": T0
   "github__search_*": T0
-  "gmail__list_*": T0
   "gmail__search_*": T0
   "gmail__get_*": T0
-  "notion__search": T0
-  "notion__fetch": T0
+  "notion__API-post-search": T0
+  "notion__API-retrieve-*": T0
   "local__memory_search": T0
   "local__now": T0
 
   # --- T1: reversible, private blast radius ---
-  "gmail__create_draft": T1
-  "notion__create-pages": T1
-  "notion__update-page": T1
-  "github__create_issue": T1
+  "gmail__draft_*": T1
+  "notion__API-post-page": T1
+  "notion__API-update-*": T1
   "local__remember": T1
 
   # --- T2: irreversible or externally visible ---
   "gmail__send*": T2
+  "github__create_issue": T2     # public on the repo, so externally visible
   "github__merge_*": T2
   "github__create_pull_request": T2
   "market__*": T2          # metered free tier -- ~25 req/day
