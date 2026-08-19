@@ -11,7 +11,7 @@
   <img alt="FastAPI" src="https://img.shields.io/badge/api-FastAPI-009688?logo=fastapi&logoColor=white">
   <img alt="Next.js" src="https://img.shields.io/badge/ui-Next.js%2015-000000?logo=nextdotjs&logoColor=white">
   <img alt="MCP" src="https://img.shields.io/badge/tools-MCP-1f6feb">
-  <img alt="eval" src="https://img.shields.io/badge/eval%20bank-69.1%25-yellow">
+  <img alt="eval" src="https://img.shields.io/badge/eval%20bank-74.1%25-yellow">
   <img alt="cost" src="https://img.shields.io/badge/cost-%E2%82%B90-brightgreen">
 </p>
 
@@ -32,6 +32,7 @@
 - [Status and roadmap](#status-and-roadmap)
 
 ---
+<img width="1918" height="925" alt="image" src="https://github.com/user-attachments/assets/134ea49d-7362-4e4a-aba6-181ba12f97a8" />
 
 ## What it is
 
