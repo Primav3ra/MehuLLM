@@ -72,7 +72,7 @@ class BankReport:
         return {k: (v[0], v[1]) for k, v in sorted(out.items())}
 
 
-# ------------------------------------------------------------ event capture.
+# ------------------------------------------------------------ event capture
 
 
 def _transcript_from(events: list[dict[str, Any]], sid: str, latency_ms: int) -> Transcript:
@@ -108,7 +108,7 @@ def _transcript_from(events: list[dict[str, Any]], sid: str, latency_ms: int) ->
     return t
 
 
-# ------------------------------------------------------------------- runner.
+# ------------------------------------------------------------------- runner
 
 
 class BankRunner:
@@ -125,7 +125,7 @@ class BankRunner:
         self.base_db = Path(base_db) if base_db else None
         self.scratch_dir = Path(scratch_dir or Path(settings.mehullm_derived_dir) / "eval")
         self.judge = judge
-        # Confirmations resolve as DENY by default. An eval that auto-approves.
+        # Deny by default: an eval that auto-approved would never exercise the gate.
         self.auto_deny = auto_deny
         self.runs = RunManager()
 
@@ -186,8 +186,8 @@ class BankRunner:
         # Start clean. Scratch dbs from an earlier run are what get locked, and a
         # stale one is never wanted -- every scenario reseeds from base_db anyway.
         if self.scratch_dir.exists():
-            # -wal and -shm too, NOT just *.db. A stale write-ahead log sitting
-            # beside a freshly copied database is worse than a stale database:
+            # -wal and -shm too, not just *.db: a stale write-ahead log beside a
+            # freshly copied database silently resurrects the old contents.
             for pat in ("*.db", "*.db-wal", "*.db-shm"):
                 for p in self.scratch_dir.glob(pat):
                     with _suppress():
@@ -203,14 +203,22 @@ class BankRunner:
             r = await self.run_one(s)
             rep.results.append(r)
             with live.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({
-                    "id": s.id, "category": s.category, "weight": s.weight,
-                    "passed": r.passed, "failures": r.failures,
-                    "latency_ms": r.transcript.latency_ms,
-                    "steps": r.transcript.steps,
-                    "tools": r.transcript.tools_called,
-                    "output": r.transcript.final_text[:500],
-                }) + chr(10))
+                fh.write(
+                    json.dumps(
+                        {
+                            "id": s.id,
+                            "category": s.category,
+                            "weight": s.weight,
+                            "passed": r.passed,
+                            "failures": r.failures,
+                            "latency_ms": r.transcript.latency_ms,
+                            "steps": r.transcript.steps,
+                            "tools": r.transcript.tools_called,
+                            "output": r.transcript.final_text[:500],
+                        }
+                    )
+                    + chr(10)
+                )
             if on_result:
                 on_result(r)
         rep.elapsed_s = time.monotonic() - t0
@@ -257,7 +265,7 @@ class _suppress:
         return True
 
 
-# --------------------------------------------------------------- persistence.
+# --------------------------------------------------------------- persistence
 
 
 def git_sha() -> str:

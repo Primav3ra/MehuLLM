@@ -366,7 +366,7 @@ async def status():
 async def health():
     import shutil
 
-    # The import lives inside the guard on purpose: health is what you call.
+    # psutil is optional, and health must answer even when it is missing.
     free_ram = None
     with contextlib.suppress(Exception):
         import psutil  # type: ignore[import-not-found]

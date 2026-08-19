@@ -35,7 +35,7 @@ class ToolOutcome:
 
 @dataclass
 class _LocalResult:
-    """Shapes a local-tool return like an MCPHub ToolResult so the rest of the interceptor is identical for both."""
+    """Shape a local-tool return like a hub ToolResult, so one code path serves both."""
 
     text: str
     is_error: bool = False
@@ -64,8 +64,7 @@ class Interceptor:
         self.killswitch = killswitch
         self.limiter = limiter or RateLimiter()
         self.confirm_timeout_s = confirm_timeout_s
-        # Native memory tools. Routed through THIS SAME path, not around it --
-        # there is exactly one way to call a tool.
+        # Native memory tools go through THIS path, not around it: one way to call a tool.
         self.local_tools = local_tools
 
     async def execute(self, run: Run, call: ToolCall) -> ToolOutcome:
@@ -73,84 +72,124 @@ class Interceptor:
             return await self._execute(run, call, sp)
 
     async def _execute(self, run: Run, call: ToolCall, sp: Any) -> ToolOutcome:
+        """Run the gates in order; the first one to produce an outcome short-circuits."""
         started = time.monotonic()
 
-        def err(msg: str) -> ToolOutcome:
-            return ToolOutcome(call.id, call.name, msg, True)
-
-        try:
-            self.killswitch.check()
-        except Killed as e:
-            await run.emit(ev.guardrail_blocked("kill", "kill_switch", str(e), call.name))
-            return err(str(e))
+        if (stop := await self._killed(run, call)) is not None:
+            return stop
 
         ref = self.registry.resolve(call.name)
         if ref is None:
-            # Never split the model's string -- always dict-lookup.
-            known = sorted(d.name for d in self.registry.tool_defs())
-            sp.status, sp.error = "error", f"unknown tool {call.name}"
-            log.warning(
-                "tool.unknown",
-                tool=call.name,
-                registered=len(known),
-                servers=sorted({k.split("__")[0] for k in known}),
-            )
-            return err(f"Unknown tool {call.name!r}. Use one of the tools provided.")
+            return self._unknown_tool(call, sp)
 
         verdict = self.policy.evaluate(
             call.name, read_only_hint=ref.read_only_hint, provenance=run.provenance
         )
+        if (stop := await self._denied(run, call, verdict)) is not None:
+            return stop
+        if (stop := await self._rate_limited(run, call, ref)) is not None:
+            return stop
 
-        if verdict.action == "deny":
-            await run.emit(
-                ev.guardrail_blocked(verdict.rule_id, "policy", verdict.reason, call.name)
-            )
-            return err(
-                f"Blocked by policy: {verdict.reason or verdict.rule_id}. "
-                "Explain this to the user and offer an alternative."
-            )
-
-        try:
-            self.limiter.acquire(call.name, ref.server_id)
-        except RateLimited as e:
-            await run.emit(ev.guardrail_blocked("ratelimit", "rate_limit", str(e), call.name))
-            return err(f"{e}. Try again later or use a different approach.")
-
-        # Rehydrate BEFORE showing the confirmation card: the whole point of
-        # human review is seeing the real values that will actually be sent.
-        args = run.vault.rehydrate(call.args)
-        args = _with_defaults(ref.server_id, args)
-
-        if (
-            verdict.action == "confirm"
-            and _key(ref.server_id, ref.tool_name) not in run.session_grants
-        ):
-            with tracing.span("confirm", "guardrail", tool=call.name) as csp:
-                decision = await self._confirm(run, call, ref, verdict, args)
-                csp.attrs.update(decision=decision.approved, by=decision.by)
-            if not decision.approved:
-                # _confirm already emitted the real confirmation_resolved.
-                return err(
-                    f"The user declined this action. {decision.reason} "
-                    "Do not attempt it via another tool."
-                )
+        # Rehydrate BEFORE the confirmation card: human review is pointless unless it
+        # shows the real values that will be sent.
+        args = _with_defaults(ref.server_id, run.vault.rehydrate(call.args))
+        if (stop := await self._declined(run, call, ref, verdict, args)) is not None:
+            return stop
 
         await run.emit(
             ev.tool_start(call.id, call.name, ref.server_id, verdict.risk, _preview(call.args))
         )
 
-        # Identical call, same turn: return the first result instead of paying for
-        # it again. Observed: local__memory_search called 8x in a row.
         memo = _memo_key(call.name, args)
-        if (prior := run.tool_memo.get(memo)) is not None:
-            log.info("tool.repeat", tool=call.name)
-            sp.attrs["repeat"] = True
-            text = prior + REPEAT_NOTE
-            await run.emit(
-                ev.tool_result(call.id, call.name, True, 0, text[:PREVIEW], len(text), False)
-            )
-            return ToolOutcome(call.id, call.name, text, False)
+        if (stop := await self._replay(run, call, sp, memo)) is not None:
+            return stop
 
+        result = await self._dispatch(ref, call, args)
+        text = await self._clean(run, call, ref, result)
+        run.tool_memo[memo] = text
+
+        sp.output_text = text[:PREVIEW]
+        sp.attrs.update(server=ref.server_id, risk=verdict.risk, ok=not result.is_error)
+        await run.emit(
+            ev.tool_result(
+                call.id,
+                call.name,
+                not result.is_error,
+                int((time.monotonic() - started) * 1000),
+                text[:PREVIEW],
+                result.bytes_,
+                result.truncated,
+            )
+        )
+        return ToolOutcome(call.id, call.name, text, result.is_error)
+
+    async def _killed(self, run: Run, call: ToolCall) -> ToolOutcome | None:
+        try:
+            self.killswitch.check()
+        except Killed as e:
+            await run.emit(ev.guardrail_blocked("kill", "kill_switch", str(e), call.name))
+            return _err(call, str(e))
+        return None
+
+    def _unknown_tool(self, call: ToolCall, sp: Any) -> ToolOutcome:
+        known = sorted(d.name for d in self.registry.tool_defs())
+        sp.status, sp.error = "error", f"unknown tool {call.name}"
+        log.warning(
+            "tool.unknown",
+            tool=call.name,
+            registered=len(known),
+            servers=sorted({k.split("__")[0] for k in known}),
+        )
+        return _err(call, f"Unknown tool {call.name!r}. Use one of the tools provided.")
+
+    async def _denied(self, run: Run, call: ToolCall, verdict) -> ToolOutcome | None:
+        if verdict.action != "deny":
+            return None
+        await run.emit(ev.guardrail_blocked(verdict.rule_id, "policy", verdict.reason, call.name))
+        return _err(
+            call,
+            f"Blocked by policy: {verdict.reason or verdict.rule_id}. "
+            "Explain this to the user and offer an alternative.",
+        )
+
+    async def _rate_limited(self, run: Run, call: ToolCall, ref) -> ToolOutcome | None:
+        try:
+            self.limiter.acquire(call.name, ref.server_id)
+        except RateLimited as e:
+            await run.emit(ev.guardrail_blocked("ratelimit", "rate_limit", str(e), call.name))
+            return _err(call, f"{e}. Try again later or use a different approach.")
+        return None
+
+    async def _declined(
+        self, run: Run, call: ToolCall, ref, verdict, args: dict
+    ) -> ToolOutcome | None:
+        if verdict.action != "confirm" or _key(ref.server_id, ref.tool_name) in run.session_grants:
+            return None
+        with tracing.span("confirm", "guardrail", tool=call.name) as csp:
+            decision = await self._confirm(run, call, ref, verdict, args)
+            csp.attrs.update(decision=decision.approved, by=decision.by)
+        if decision.approved:
+            return None
+        # _confirm already emitted the real confirmation_resolved.
+        return _err(
+            call,
+            f"The user declined this action. {decision.reason} Do not attempt it via another tool.",
+        )
+
+    async def _replay(self, run: Run, call: ToolCall, sp: Any, memo: str) -> ToolOutcome | None:
+        """Identical call, same turn: reuse the first result rather than paying again."""
+        prior = run.tool_memo.get(memo)
+        if prior is None:
+            return None
+        log.info("tool.repeat", tool=call.name)
+        sp.attrs["repeat"] = True
+        text = prior + REPEAT_NOTE
+        await run.emit(
+            ev.tool_result(call.id, call.name, True, 0, text[:PREVIEW], len(text), False)
+        )
+        return ToolOutcome(call.id, call.name, text, False)
+
+    async def _dispatch(self, ref, call: ToolCall, args: dict):
         with tracing.span("dispatch", "tool_call", server=ref.server_id) as dsp:
             if ref.server_id == "local" and self.local_tools is not None:
                 text_out, is_err = await self.local_tools.call(call.name, args)
@@ -158,7 +197,10 @@ class Interceptor:
             else:
                 result = await self.hub.call(ref, args)
             dsp.attrs["is_error"] = result.is_error
+        return result
 
+    async def _clean(self, run: Run, call: ToolCall, ref, result) -> str:
+        """Strip credentials and PII from tool output before the model sees it."""
         text, secrets = run.vault.scrub_secrets(result.text)
         if secrets:
             await run.emit(
@@ -169,26 +211,8 @@ class Interceptor:
                     call.name,
                 )
             )
-        text = run.vault.redact(text)
         run.provenance.add(ref.server_id)
-
-        run.tool_memo[memo] = text
-
-        ms = int((time.monotonic() - started) * 1000)
-        sp.output_text = text[:PREVIEW]
-        sp.attrs.update(server=ref.server_id, risk=verdict.risk, ok=not result.is_error)
-        await run.emit(
-            ev.tool_result(
-                call.id,
-                call.name,
-                not result.is_error,
-                ms,
-                text[:PREVIEW],
-                result.bytes_,
-                result.truncated,
-            )
-        )
-        return ToolOutcome(call.id, call.name, text, result.is_error)
+        return run.vault.redact(text)
 
     async def _confirm(self, run: Run, call: ToolCall, ref, verdict, args: dict) -> Decision:
         iid, fut = run.new_interaction()
@@ -209,8 +233,8 @@ class Interceptor:
         try:
             decision: Decision = await asyncio.wait_for(fut, self.confirm_timeout_s)
         except TimeoutError:
-            # Timeout is a DENY, not an error. The model handles this gracefully
-            # because the system prompt says denial is expected.
+            # A timeout is a DENY, not an error; the system prompt tells the model
+            # that denial is an expected outcome.
             decision = Decision(False, "No response within the time limit.", by="timeout")
         finally:
             run.pending.pop(iid, None)
@@ -221,9 +245,12 @@ class Interceptor:
         return decision
 
 
+def _err(call: ToolCall, msg: str) -> ToolOutcome:
+    return ToolOutcome(call.id, call.name, msg, True)
+
+
 def _with_defaults(server_id: str, args: dict) -> dict:
-    """Bind account identity the model cannot know. Left to guess, it fabricates
-    plausible addresses like mehulkarwa@gmail.com."""
+    """Bind account identity the model cannot know; unbound, it invents an address."""
     if server_id != "gmail" or not settings.gmail_account:
         return args
     return {**args, "user_google_email": settings.gmail_account}
@@ -238,8 +265,6 @@ def _key(server: str, tool: str) -> str:
 
 
 def _preview(args: Any, n: int = 160) -> str:
-    import json
-
     try:
         s = json.dumps(args, ensure_ascii=False)
     except (TypeError, ValueError):

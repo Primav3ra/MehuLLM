@@ -1,7 +1,7 @@
 """Talk to a running MehuLLM backend from the terminal.
 
-    uv run --no-sync python scripts/chat.py "what sports do I play?"
-    uv run --no-sync python scripts/chat.py            # interactive
+uv run --no-sync python scripts/chat.py "what sports do I play?"
+uv run --no-sync python scripts/chat.py            # interactive
 """
 
 from __future__ import annotations
@@ -20,8 +20,9 @@ DIM, TOOL, BOT, WARN, OFF = "\033[2m", "\033[36m", "\033[38;5;209m", "\033[33m",
 
 def _post(path: str, body: dict):
     data = json.dumps(body).encode()
-    req = urllib.request.Request(f"{API}{path}", data=data,
-                                headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        f"{API}{path}", data=data, headers={"Content-Type": "application/json"}
+    )
     if settings.mehullm_api_token:
         req.add_header("Authorization", f"Bearer {settings.mehullm_api_token}")
     return urllib.request.urlopen(req, timeout=300)
@@ -33,8 +34,10 @@ def ask(message: str, conversation: str = "cli") -> None:
         stream = _post("/api/chat", {"message": message, "conversation_id": conversation})
     except urllib.error.URLError as e:
         print(f"{WARN}backend not reachable at {API} ({e.reason}){OFF}")
-        print(f"{DIM}start it with: uv run --no-sync uvicorn mehullm.api.app:app "
-              f"--host {settings.mehullm_host} --port {settings.mehullm_port}{OFF}")
+        print(
+            f"{DIM}start it with: uv run --no-sync uvicorn mehullm.api.app:app "
+            f"--host {settings.mehullm_host} --port {settings.mehullm_port}{OFF}"
+        )
         return
     for raw in stream:
         line = raw.decode("utf-8", "replace")
@@ -56,16 +59,19 @@ def ask(message: str, conversation: str = "cli") -> None:
             print(f"\n{WARN}CONFIRM {e['tool']}{OFF}\n  {e['summary']}")
             print(f"  args: {json.dumps(e['arguments'])[:300]}")
             yes = input("  approve? [y/N] ").strip().lower().startswith("y")
-            _post(f"/api/chat/{run_id}/confirm",
-                  {"interaction_id": e["interaction_id"],
-                   "decision": "approve" if yes else "deny"}).read()
+            _post(
+                f"/api/chat/{run_id}/confirm",
+                {"interaction_id": e["interaction_id"], "decision": "approve" if yes else "deny"},
+            ).read()
         elif kind == "voice_delta":
             print(f"\n\n{BOT}{e['text']}{OFF}")
         elif kind == "error":
             print(f"\n{WARN}error: {e['message'][:200]}{OFF}")
         elif kind == "done":
-            print(f"{DIM}[{e['steps']} steps · {e['tool_calls']} tools · "
-                  f"{e['total_ms']}ms · {e['trace_id']}]{OFF}\n")
+            print(
+                f"{DIM}[{e['steps']} steps · {e['tool_calls']} tools · "
+                f"{e['total_ms']}ms · {e['trace_id']}]{OFF}\n"
+            )
 
 
 def main() -> int:

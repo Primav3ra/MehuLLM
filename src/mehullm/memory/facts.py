@@ -63,11 +63,8 @@ def _embed_text(e: dict) -> str:
     return f"{head}. {e['text']}" if pred else e["text"]
 
 
-def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
-    store = MemoryStore(db_path)
-    con = store.conn()
-    st = LoadStats()
-
+def _read_entries(facts_dir: str, st: LoadStats) -> list[dict]:
+    """Parse every fact file, rejecting duplicates and unusable entries."""
     entries: list[dict] = []
     seen: dict[int, str] = {}
     for path in sorted(Path(facts_dir).glob("*.yaml")):
@@ -79,9 +76,8 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
             if not isinstance(raw, dict):
                 st.errors.append(f"{path.name}: entry is not a mapping: {raw!r}")
                 continue
-            # An unfilled template line is the normal state, not an error --
             if not str(raw.get("text", "")).strip():
-                st.blank += 1
+                st.blank += 1  # an unfilled template line is the normal state
                 continue
             try:
                 fid = int(str(raw["id"]).lstrip("Ff"))
@@ -94,15 +90,15 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
             seen[fid] = path.name
             raw["_id"] = fid
             entries.append(raw)
+    return entries
 
-    if not entries:
-        return st
 
-    # Self-heal an facts_fts built before the porter tokenizer. It is an.
-    sql = con.execute(
+def _ensure_porter_fts(con) -> None:
+    """Rebuild an facts_fts created before the porter tokenizer, whose stemming differs."""
+    row = con.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='facts_fts'"
     ).fetchone()
-    if sql and "porter" not in (sql[0] or ""):
+    if row and "porter" not in (row[0] or ""):
         con.executescript(
             "DROP TABLE IF EXISTS facts_fts;"
             "CREATE VIRTUAL TABLE facts_fts USING fts5("
@@ -110,12 +106,8 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
             "  tokenize='porter unicode61 remove_diacritics 2');"
         )
 
-    # Residue from the retired extraction pipeline. Those landed as 'pending'
-    # and were never approved; curated facts are 'active' by construction.
-    dropped = con.execute("DELETE FROM facts WHERE status='pending'").rowcount
-    if dropped:
-        st.errors.append(f"cleared {dropped} unapproved facts left by the old extractor")
 
+def _upsert(con, entries: list[dict], st: LoadStats) -> None:
     vecs = embed_passages([_embed_text(e) for e in entries])
     now = int(time.time())
 
@@ -150,21 +142,42 @@ def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
                 int(str(e["superseded_by"]).lstrip("Ff")) if e.get("superseded_by") else None,
             ),
         )
-        # facts_fts is EXTERNAL-CONTENT (content='facts'), so it is rebuilt in.
+        # facts_fts is external-content (content='facts') and cannot be DELETEd
+        # directly; it is rebuilt separately, so only facts_vec is touched here.
         con.execute("DELETE FROM facts_vec WHERE fact_id=?", (fid,))
         con.execute("INSERT INTO facts_vec(fact_id, embedding) VALUES (?,?)", (fid, pack(vec)))
 
-        if exists:
-            st.updated += 1
-        else:
-            st.inserted += 1
+        st.updated += 1 if exists else 0
+        st.inserted += 0 if exists else 1
 
-    # A fact naming `superseded_by` retires its predecessor. Done after the full
-    # pass so forward references work regardless of file order.
+
+def _apply_supersession(con, entries: list[dict], st: LoadStats) -> None:
+    """Run after the full pass, so forward references work regardless of file order."""
     for e in entries:
         if e.get("superseded_by"):
             con.execute("UPDATE facts SET status='superseded' WHERE id=?", (e["_id"],))
             st.superseded += 1
+
+
+def load_dir(db_path: str, facts_dir: str = FACTS_DIR) -> LoadStats:
+    store = MemoryStore(db_path)
+    con = store.conn()
+    st = LoadStats()
+
+    entries = _read_entries(facts_dir, st)
+    if not entries:
+        return st
+
+    _ensure_porter_fts(con)
+
+    # Residue from the retired extraction pipeline: those landed as 'pending' and
+    # were never approved, while curated facts are 'active' by construction.
+    dropped = con.execute("DELETE FROM facts WHERE status='pending'").rowcount
+    if dropped:
+        st.errors.append(f"cleared {dropped} unapproved facts left by the old extractor")
+
+    _upsert(con, entries, st)
+    _apply_supersession(con, entries, st)
 
     con.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
     con.commit()

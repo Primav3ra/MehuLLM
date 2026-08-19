@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from mehullm.persistence import db
+
 PT = ZoneInfo("America/Los_Angeles")
 
 SCHEMA = """
@@ -64,8 +66,7 @@ class QuotaStore:
     def _conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-            c.execute("PRAGMA journal_mode=WAL")
+            c = db.connect(self.path, rows=False)
             self._local.c = c
         return c
 

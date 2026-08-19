@@ -11,7 +11,7 @@ import regex
 
 __all__ = ["PATTERNS", "NameMap", "scrub", "scrub_with_stats"]
 
-# Digit class covering ASCII and Devanagari numerals. Indian phone numbers do.
+# Covers ASCII and Devanagari numerals: Indian numbers appear in both scripts.
 _D = r"[0-9०-९]"
 
 PATTERNS: dict[str, regex.Pattern] = {
@@ -77,7 +77,8 @@ def scrub(text: str) -> str:
     return scrub_with_stats(text)[0]
 
 
-# Two-tier OTP handling. The patterns above need the keyword and the digits to.
+# Two-tier OTP handling: the patterns above need keyword and digits adjacent,
+# these catch the case where they are separated, often across lines.
 _OTP_KEYWORD_RE = regex.compile(
     r"\b(?:OTP|O\.T\.P|one[\s\-]?time\s*(?:password|code|pin)|verification\s+code)\b",
     regex.IGNORECASE,

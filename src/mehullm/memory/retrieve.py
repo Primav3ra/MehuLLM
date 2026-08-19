@@ -26,7 +26,8 @@ class Hit:
     meta: dict | None = None
 
 
-# Stripped from FTS queries. Not for tidiness -- an OR query over stopwords.
+# Stripped from FTS queries: an OR over stopwords matches nearly every row and
+# swamps the ranking.
 _STOPWORDS = frozenset(
     [
         "a",
@@ -166,8 +167,7 @@ def _fts_query(text: str) -> str:
     return " OR ".join(f'"{w}"' for w in words[:24])
 
 
-# FTS5 DOES NOT RANK BY DEFAULT.
-#
+# FTS5 does not rank by default; without this, rows come back in rowid order.
 _ORDER_BY_RANK = "ORDER BY rank"
 
 
@@ -175,7 +175,8 @@ def _rrf(rank: int) -> float:
     return 1.0 / (RRF_K + rank)
 
 
-# Formatting instructions are addressed to the MODEL, not to memory, and they.
+# Formatting instructions are addressed to the MODEL, not to memory, and they
+# wreck retrieval if they reach the query.
 _INSTRUCTION_TAIL = re.compile(
     r"[\s,.;–—-]*\b(?:"
     r"one line|in one line|keep it short|keep it brief|be brief|briefly|"
@@ -221,7 +222,11 @@ def _superseded(store: MemoryStore, query: str, k: int) -> list[Hit]:
     )
     return [
         Hit(
-            r["id"], r["text"], "fact", 0.0, bm25_rank=i,
+            r["id"],
+            r["text"],
+            "fact",
+            0.0,
+            bm25_rank=i,
             meta={
                 "confidence": r["confidence"],
                 "observed_at": r["observed_at"],

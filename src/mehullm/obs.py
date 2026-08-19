@@ -68,10 +68,6 @@ def bind_run(**kw: Any) -> None:
     structlog.contextvars.bind_contextvars(**{k: v for k, v in kw.items() if v is not None})
 
 
-def clear_run() -> None:
-    structlog.contextvars.clear_contextvars()
-
-
 def redacted_len(value: str) -> str:
     """Describe a secret without printing it."""
     return f"resolved(len={len(value)})" if value else "EMPTY"

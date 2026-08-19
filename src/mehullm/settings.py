@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    # NOT gemini-3.5-flash: its free tier is 20 requests PER DAY, and one agent.
+    # NOT gemini-3.5-flash: 20 requests per day, which a single agent turn can spend.
     gemini_model: str = "gemini-3.5-flash-lite"
     # A LADDER, because free-tier quota is per-model.
     gemini_models: str = (

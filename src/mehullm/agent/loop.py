@@ -29,6 +29,11 @@ from mehullm.persistence import tracing
 
 log = get_logger(__name__)
 
+_MIN_VOICE_CHARS = 40
+_TIMEOUT_ANSWER = (
+    "I ran out of time on this one before I could finish. Ask me again, or narrow the question."
+)
+
 
 @dataclass
 class LoopConfig:
@@ -69,121 +74,44 @@ class AgentLoop:
         started = time.monotonic()
         tools = self.registry.tool_defs()
         system = system_prompt(memory_facts)
-        tool_calls_total = 0
+        calls_total = 0
         step = 0
         final_text = ""
 
-        # Ingress: redact PII before anything reaches the hosted model.
-        redacted = run.vault.redact(user_message)
-        run.history.append(Msg(role="user", text=redacted))
-
-        provider = self.router.pick()
-        turn_span.attrs.update(
-            tools=len(tools),
-            servers=sorted({d.name.split("__")[0] for d in tools}),
-            schema_tokens=self.registry.estimated_schema_tokens(),
-            voice=type(self.voice).__name__ if self.voice else None,
-        )
-        turn_span.input_text = user_message
-        log.info(
-            "turn.start",
-            tools=len(tools),
-            servers=sorted({d.name.split("__")[0] for d in tools}),
-            provider=provider.client.name,
-            voice=bool(self.voice),
-        )
-        await run.emit(
-            ev.run_start(
-                run.conversation_id, provider.client.name, provider.client.model, len(tools)
-            )
-        )
+        # Redact PII before anything reaches the hosted model.
+        run.history.append(Msg(role="user", text=run.vault.redact(user_message)))
+        await self._announce(run, turn_span, tools, user_message)
 
         try:
             for step in range(1, self.cfg.max_steps + 1):
                 self.killswitch.check()
                 if time.monotonic() - started > self.cfg.max_turn_seconds:
-                    await run.emit(
-                        ev.guardrail_blocked(
-                            "wall-clock", "policy", f"turn exceeded {self.cfg.max_turn_seconds}s"
-                        )
-                    )
+                    limit = self.cfg.max_turn_seconds
+                    await self._blocked(run, "wall-clock", f"turn exceeded {limit}s")
                     break
 
                 await run.emit(ev.status("thinking"))
-
-                text_parts: list[str] = []
-                calls: list[ToolCall] = []
-                async for event in self.router.stream(
-                    system=system,
-                    messages=run.history,
-                    tools=tools,
-                    max_tokens=self.cfg.max_tokens,
-                ):
-                    if isinstance(event, TextDelta):
-                        text_parts.append(event.text)
-                        await run.emit(ev.text_delta(event.text, step))
-                    elif isinstance(event, ToolCallReady):
-                        calls.append(event.call)
-                    elif isinstance(event, UsageEvent):
-                        await run.emit(
-                            ev.usage(event.usage.input_tokens, event.usage.output_tokens, step)
-                        )
-                    elif isinstance(event, StreamEnd):
-                        break
-
-                for sw in self.router.drain_switches():
-                    await run.emit(ev.provider_switch(sw.from_provider, sw.to_provider, sw.reason))
-
-                assistant_text = "".join(text_parts)
-                run.history.append(
-                    Msg(role="assistant", text=assistant_text or None, tool_calls=calls)
-                )
+                text, calls = await self._collect_stream(run, system, tools, step)
+                run.history.append(Msg(role="assistant", text=text or None, tool_calls=calls))
 
                 if not calls:
-                    final_text = assistant_text
+                    final_text = text
                     break
 
-                tool_calls_total += len(calls)
-                if tool_calls_total > self.cfg.max_tool_calls_per_turn:
-                    await run.emit(
-                        ev.guardrail_blocked(
-                            "tool-budget",
-                            "policy",
-                            f"exceeded {self.cfg.max_tool_calls_per_turn} tool calls this turn",
-                        )
-                    )
+                calls_total += len(calls)
+                if calls_total > self.cfg.max_tool_calls_per_turn:
+                    budget = self.cfg.max_tool_calls_per_turn
+                    await self._blocked(run, "tool-budget", f"exceeded {budget} tool calls")
                     break
 
                 await run.emit(ev.status("calling_tools", f"{len(calls)} call(s)"))
-
-                # Parallel across calls. Confirmations therefore arrive as a
-                # STACK of cards, not a modal -- the UI must handle that.
-                outcomes = await asyncio.gather(*(self.interceptor.execute(run, c) for c in calls))
-                # Every call gets a result, in ONE batch, in call order.
-                for out in outcomes:
-                    run.history.append(
-                        Msg(
-                            role="tool",
-                            tool_call_id=out.tool_call_id,
-                            tool_name=out.tool_name,
-                            text=wrap_untrusted(out.text, out.tool_name),
-                            is_error=out.is_error,
-                        )
-                    )
+                await self._dispatch(run, calls)
             else:
-                await run.emit(
-                    ev.guardrail_blocked(
-                        "step-cap", "policy", f"hit the {self.cfg.max_steps}-step limit"
-                    )
-                )
+                await self._blocked(run, "step-cap", f"hit the {self.cfg.max_steps}-step limit")
 
             if not final_text.strip():
-                # A guard broke the loop after a tool step, so no answer was
-                # generated. Say so rather than returning an empty turn.
-                final_text = (
-                    "I ran out of time on this one before I could finish. "
-                    "Ask me again, or narrow the question."
-                )
+                # A guard broke the loop after a tool step, so no answer exists yet.
+                final_text = _TIMEOUT_ANSWER
                 log.warning("turn.no_answer", steps=step)
             final_text = await self._voice(run, final_text)
             run.status = "ok"
@@ -208,32 +136,98 @@ class AgentLoop:
         finally:
             run.final_text = final_text
             run.finished = True
-            # done is ALWAYS last and ALWAYS exactly one -- the client has a
-            # single teardown path.
+            # done is ALWAYS last and ALWAYS exactly one: the client has one teardown path.
             await run.emit(
                 ev.done(
                     run.status,
                     final_text,
                     step,
-                    tool_calls_total,
+                    calls_total,
                     int((time.monotonic() - started) * 1000),
                 )
             )
+
+    async def _announce(self, run: Run, turn_span: Any, tools: list, user_message: str) -> None:
+        servers = sorted({d.name.split("__")[0] for d in tools})
+        provider = self.router.pick()
+        turn_span.attrs.update(
+            tools=len(tools),
+            servers=servers,
+            schema_tokens=self.registry.estimated_schema_tokens(),
+            voice=type(self.voice).__name__ if self.voice else None,
+        )
+        turn_span.input_text = user_message
+        log.info(
+            "turn.start",
+            tools=len(tools),
+            servers=servers,
+            provider=provider.client.name,
+            voice=bool(self.voice),
+        )
+        await run.emit(
+            ev.run_start(
+                run.conversation_id, provider.client.name, provider.client.model, len(tools)
+            )
+        )
+
+    async def _blocked(self, run: Run, rule: str, detail: str) -> None:
+        await run.emit(ev.guardrail_blocked(rule, "policy", detail))
+
+    async def _collect_stream(
+        self, run: Run, system: str, tools: list, step: int
+    ) -> tuple[str, list[ToolCall]]:
+        """Drain one model turn into (text, tool calls)."""
+        parts: list[str] = []
+        calls: list[ToolCall] = []
+        async for event in self.router.stream(
+            system=system,
+            messages=run.history,
+            tools=tools,
+            max_tokens=self.cfg.max_tokens,
+        ):
+            if isinstance(event, TextDelta):
+                parts.append(event.text)
+                await run.emit(ev.text_delta(event.text, step))
+            elif isinstance(event, ToolCallReady):
+                calls.append(event.call)
+            elif isinstance(event, UsageEvent):
+                await run.emit(ev.usage(event.usage.input_tokens, event.usage.output_tokens, step))
+            elif isinstance(event, StreamEnd):
+                break
+
+        for sw in self.router.drain_switches():
+            await run.emit(ev.provider_switch(sw.from_provider, sw.to_provider, sw.reason))
+        return "".join(parts), calls
+
+    async def _dispatch(self, run: Run, calls: list[ToolCall]) -> None:
+        """Run calls in parallel, so confirmations arrive as a stack of cards, not a modal."""
+        outcomes = await asyncio.gather(*(self.interceptor.execute(run, c) for c in calls))
+        for out in outcomes:  # every call gets a result, in one batch, in call order
+            run.history.append(
+                Msg(
+                    role="tool",
+                    tool_call_id=out.tool_call_id,
+                    tool_name=out.tool_name,
+                    text=wrap_untrusted(out.text, out.tool_name),
+                    is_error=out.is_error,
+                )
+            )
+
+    def _voice_skip(self, draft: str) -> str | None:
+        if not self.cfg.voice_enabled:
+            return "disabled"
+        if self.voice is None:
+            return "no_model"
+        if len(draft) < _MIN_VOICE_CHARS:
+            return "too_short"
+        return None
 
     async def _voice(self, run: Run, draft: str) -> str:
         """Voice only the final turn, and never let it change facts."""
         if not draft:
             return draft
 
-        skip = (
-            "disabled"
-            if not self.cfg.voice_enabled
-            else "no_model"
-            if self.voice is None
-            else "too_short"
-            if len(draft) < 40
-            else None
-        )
+        skip = self._voice_skip(draft)
         if skip:
             with tracing.span("voice", "voice_rewrite", skipped=skip) as sp:
                 sp.status = "skipped"

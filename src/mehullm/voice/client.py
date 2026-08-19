@@ -135,8 +135,8 @@ class OllamaClient:
             },
         }
         if fmt is not None:
-            # `think: false` alone does not stop qwen3 narrating in plain text;
-            # a schema makes prose impossible. ~32s -> a fraction of it.
+            # `think: false` alone does not stop qwen3 narrating its reasoning;
+            # a forced schema makes prose impossible, which is what cuts latency.
             payload["format"] = fmt
         c = client or self._client()
         try:

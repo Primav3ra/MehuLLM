@@ -25,12 +25,7 @@ class _InjectingHub:
         return getattr(self._inner, item)
 
     async def call(self, ref: Any, args: dict[str, Any], timeout: float | None = None):
-        """Injected results must be ToolResult, like the real hub returns.
-
-        A bare str made the interceptor raise "'str' object has no attribute
-        is_error", and raising for inject.error killed the turn -- so every
-        injection scenario failed on contact instead of exercising the guardrail.
-        """
+        """Return a ToolResult like the real hub: the interceptor reads .is_error."""
         name = getattr(ref, "namespaced", None) or getattr(ref, "name", "")
         want = self._inject.get("tool")
         if not (want and _glob(want, name)):
@@ -42,15 +37,16 @@ class _InjectingHub:
         if "result_bytes" in self._inject:
             n = int(self._inject["result_bytes"])
             full = "Subject: mail\n" * (n // 14)
-            return ToolResult(full[:MAX_RESULT_CHARS], bytes_=len(full),
-                              truncated=len(full) > MAX_RESULT_CHARS)
+            return ToolResult(
+                full[:MAX_RESULT_CHARS], bytes_=len(full), truncated=len(full) > MAX_RESULT_CHARS
+            )
         out = str(self._inject.get("result", ""))
         return ToolResult(out, bytes_=len(out))
 
 
 def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None], AgentLoop]:
     """Return a factory that builds one AgentLoop per scenario."""
-    # `settings`, NOT os.getenv: keys live in .env, which only pydantic-settings.
+    # `settings`, not os.getenv: keys live in .env, which only pydantic-settings reads.
     from mehullm.settings import settings
 
     if not settings.gemini_api_key:
@@ -72,7 +68,7 @@ def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None
     from mehullm.persistence import tracing
     from mehullm.persistence.tracing import TraceStore
 
-    # The SHARED builder. This function used to construct its own providers with.
+    # Shared by the API and the eval harness so the two cannot drift apart.
     configure_logging(settings.log_level, settings.log_file)
     tracing.set_store(TraceStore(settings.mehullm_db))
     providers = build_providers()
@@ -83,7 +79,8 @@ def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None
     killswitch = KillSwitch(settings.mehullm_db)
     hub = MCPHub(specs=load_server_specs(CONFIG_DIR / "servers.yaml"), registry=registry)
 
-    # THE POINT OF THE EVAL. loop.py:190 short-circuits on `self.voice is None`,.
+    # The point of the eval: the loop short-circuits when self.voice is None, so
+    # leaving it unset would report 'no difference' by construction.
     rewriter = None
     if voice:
         from mehullm.voice.rewrite import voice_if_available
@@ -100,7 +97,7 @@ def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None
         return await hub.register_all()
 
     def factory(scenario: Scenario, db: Path | None) -> AgentLoop:
-        # Local tools were never registered here, so local__remember,.
+        # Bound per scenario, so local__* tools resolve against that scenario's db.
         from mehullm.memory.store import MemoryStore
         from mehullm.tools import local as local_tools_mod
 
@@ -117,7 +114,7 @@ def build_loop_factory(*, voice: bool = True) -> Callable[[Scenario, Path | None
                 killswitch=killswitch,
                 limiter=RateLimiter(),
                 local_tools=local_tools,
-                # Scenarios must not sit for two minutes waiting on a human who.
+                # Scenarios must not wait two minutes on a human who is not there.
                 confirm_timeout_s=10,
             ),
             killswitch=killswitch,

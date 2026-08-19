@@ -18,7 +18,6 @@ _REPEAT = regex.compile(r"(\p{L})\1{2,}")  # yaaar, cuteee
 _ALLCAPS = regex.compile(r"\b[\p{Lu}]{2,}\b")
 
 # Hindi function words written in Latin script.
-#
 HINGLISH = {
     "hai",
     "hain",
@@ -272,7 +271,8 @@ def compare(
         return StyleScore()
 
     s = StyleScore(n_generated=g.n, n_reference=r.n)
-    # Scaled by the REFERENCE rate, not absolute difference. Mehul's Hinglish.
+    # Scaled by the REFERENCE rate, not absolute difference: his Hinglish rate is
+    # low, so a fixed tolerance would score noise as a match.
     denom_h = max(r.hinglish_rate, 0.02)
     denom_d = max(r.devanagari_ratio, 0.01)
     ch = max(0.0, 1.0 - abs(g.hinglish_rate - r.hinglish_rate) / denom_h)

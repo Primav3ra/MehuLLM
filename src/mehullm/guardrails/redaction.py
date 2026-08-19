@@ -13,7 +13,8 @@ from mehullm.pipeline.pii import _ORDER, PATTERNS
 
 TOKEN_RE = re.compile(r"⟦PII_[A-Z]+_\d+⟧")
 
-# Credentials that must be hard-redacted, never vaulted. A Gmail body or a.
+# Hard-redacted, never vaulted: a recoverable placeholder could put a live
+# credential back into a later prompt.
 SECRET_RES: list[tuple[str, regex.Pattern]] = [
     ("openai_key", regex.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
     ("github_pat", regex.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),

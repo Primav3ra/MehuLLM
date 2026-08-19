@@ -10,9 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import sqlite_vec
-
 from mehullm.memory.embed import DIM
+from mehullm.persistence import db
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS chunks (
@@ -118,7 +117,8 @@ class Fact:
     status: str = "active"
 
 
-# Columns/constraints added after the first release. `CREATE TABLE IF NOT.
+# Added after the first release. CREATE TABLE IF NOT EXISTS will not add columns
+# to a table that already exists, so _migrate does it explicitly.
 _FACTS_REQUIRED_COLUMNS = {"verdict", "grounded"}
 _FACTS_REQUIRED_STATUS = "pending"
 
@@ -167,12 +167,7 @@ class MemoryStore:
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-            c.enable_load_extension(True)
-            sqlite_vec.load(c)
-            c.enable_load_extension(False)
-            c.execute("PRAGMA journal_mode=WAL")
-            c.row_factory = sqlite3.Row
+            c = db.connect(self.path, vec=True)
             self._local.c = c
         return c
 
@@ -308,16 +303,3 @@ class MemoryStore:
             "jobs_pending": one("SELECT COUNT(*) FROM extract_jobs WHERE status='pending'"),
             "jobs_done": one("SELECT COUNT(*) FROM extract_jobs WHERE status='done'"),
         }
-
-
-def _fact(r: sqlite3.Row) -> Fact:
-    return Fact(
-        id=r["id"],
-        text=r["text"],
-        subject=r["subject"],
-        predicate=r["predicate"],
-        object=r["object"],
-        confidence=r["confidence"],
-        observed_at=r["observed_at"],
-        status=r["status"],
-    )

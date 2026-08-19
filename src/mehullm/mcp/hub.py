@@ -162,7 +162,8 @@ class ServerConn:
         """mcp SDK 2.0."""
         from mcp import Client
 
-        # Servers in the wild are a MIX of protocol eras. "auto" sends the.
+        # Servers span protocol eras: "auto" tries the modern handshake, "legacy"
+        # the older initialize call.
         modes = ["auto", "legacy"] if self.spec.connect_mode == "auto" else [self.spec.connect_mode]
         last: Exception | None = None
 
@@ -285,7 +286,7 @@ class MCPHub:
     def __init__(self, specs: list[ServerSpec], registry: Registry | None = None):
         self.specs = {s.id: s for s in specs}
         self.conns = {s.id: ServerConn(s) for s in specs}
-        # `registry or Registry()` was a silent, total failure of MCP tooling.
+        # An empty Registry is falsy, so `registry or Registry()` would discard it.
         self.registry = Registry() if registry is None else registry
 
     async def start(self) -> dict[str, str]:
@@ -299,7 +300,7 @@ class MCPHub:
                 report[sid] = f"failed: unresolved config placeholders {missing}"
                 continue
             try:
-                # BOUNDED. This was an unbounded await, so one slow remote server.
+                # Bounded: otherwise one slow remote server stalls the whole startup.
                 tools = await asyncio.wait_for(conn.list_tools(), timeout=conn.spec.timeout_s)
                 n = self.registry.ingest(sid, tools, conn.spec.allow)
                 report[sid] = f"ready ({n} tools, protocol {conn.protocol_version or '?'})"
@@ -342,7 +343,8 @@ class MCPHub:
                 is_error=True,
             )
         try:
-            # BOUNDED. A lazy server's first connect spawns a process and does a.
+            # Bounded: a lazy server's first connect spawns a process and
+            # handshakes, either of which can hang indefinitely.
             await asyncio.wait_for(
                 self.ensure_registered(ref.server_id), timeout=conn.spec.timeout_s
             )

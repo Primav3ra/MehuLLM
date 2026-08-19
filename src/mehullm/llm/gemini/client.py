@@ -49,6 +49,19 @@ def _quota_details(exc: Exception) -> tuple[str, float | None, int | None]:
     return window, retry, limit
 
 
+def _parts_of(candidate: Any) -> list[Any]:
+    content = getattr(candidate, "content", None)
+    return (getattr(content, "parts", None) or []) if content else []
+
+
+def _usage(um: Any) -> Usage:
+    return Usage(
+        input_tokens=getattr(um, "prompt_token_count", 0) or 0,
+        output_tokens=getattr(um, "candidates_token_count", 0) or 0,
+        extra={"thoughts": getattr(um, "thoughts_token_count", 0) or 0},
+    )
+
+
 def _classify(exc: Exception) -> ProviderError:
     s = f"{type(exc).__name__}: {exc}".lower()
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
@@ -173,8 +186,7 @@ class GeminiClient:
             )
             async for chunk in stream:
                 for cand in getattr(chunk, "candidates", None) or []:
-                    content = getattr(cand, "content", None)
-                    for part in (getattr(content, "parts", None) or []) if content else []:
+                    for part in _parts_of(cand):
                         text = getattr(part, "text", None)
                         if text:
                             yield TextDelta(text)
@@ -198,15 +210,7 @@ class GeminiClient:
 
                 um = getattr(chunk, "usage_metadata", None)
                 if um:
-                    yield UsageEvent(
-                        Usage(
-                            input_tokens=getattr(um, "prompt_token_count", 0) or 0,
-                            output_tokens=getattr(um, "candidates_token_count", 0) or 0,
-                            extra={"thoughts": getattr(um, "thoughts_token_count", 0) or 0},
-                        ),
-                        self.name,
-                        self.model,
-                    )
+                    yield UsageEvent(_usage(um), self.name, self.model)
         except Exception as e:
             raise _classify(e) from e
 

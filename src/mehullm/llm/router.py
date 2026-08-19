@@ -27,7 +27,8 @@ RATE_LIMIT_DEMOTE_S = 15 * 60
 TRANSIENT_DEMOTE_S = 5 * 60
 SHORT_RETRY_MAX_S = 8.0
 
-# Retried in place before any failover. `rate_limit` is included because a.
+# Retried in place before failover. rate_limit belongs here because a per-minute
+# 429 clears in seconds, so waiting beats moving down the ladder.
 _RETRY_IN_PLACE = frozenset({"overloaded", "timeout", "rate_limit"})
 _TRANSIENT_RETRIES = 2
 _RETRY_BASE_S = 1.5
@@ -122,6 +123,18 @@ class LLMRouter:
         )
         self.quota.demote(provider, until, f"{err.kind}: {err}")
 
+    def _next_untried(self, tried: set[str]) -> Provider | None:
+        """The preferred provider, or the next one this turn has not attempted yet."""
+        provider = self.pick()
+        if provider.client.name not in tried:
+            return provider
+        return next((p for p in self.providers if p.client.name not in tried), None)
+
+    def _retry_sleep_s(self, err: ProviderError, attempt: int) -> float:
+        """Jittered, so concurrent runs do not retry in lockstep."""
+        delay = err.retry_after or _RETRY_BASE_S * (2**attempt)
+        return min(delay, SHORT_RETRY_MAX_S) * (0.5 + random.random())
+
     async def stream(
         self,
         *,
@@ -135,14 +148,10 @@ class LLMRouter:
         last: ProviderError | None = None
 
         for _ in range(len(self.providers)):
-            provider = self.pick()
+            provider = self._next_untried(tried)
+            if provider is None:
+                break
             name = provider.client.name
-            if name in tried:
-                remaining = [p for p in self.providers if p.client.name not in tried]
-                if not remaining:
-                    break
-                provider = remaining[0]
-                name = provider.client.name
             tried.add(name)
             self._note_switch(name, "start")
 
@@ -150,7 +159,8 @@ class LLMRouter:
             usage_in = usage_out = 0
             t_start = time.monotonic()
             stream_ms = 0
-            # Accounting MUST happen in a finally. This is an async generator and.
+            # Accounting must happen in the finally: consumers break on StreamEnd,
+            # so code after the last yield never runs -- only close() reaches here.
             recorded = False
             try:
                 # Transient failures get ONE in-place retry before failover.
@@ -188,9 +198,7 @@ class LLMRouter:
                         if attempt >= _TRANSIENT_RETRIES or not retriable:
                             raise
                         self.quota.record(name, provider.client.model, ok=False, error_kind=e.kind)
-                        delay = e.retry_after or _RETRY_BASE_S * (2**attempt)
-                        # Jitter so concurrent runs do not retry in lockstep.
-                        await asyncio.sleep(min(delay, 8.0) * (0.5 + random.random()))
+                        await asyncio.sleep(self._retry_sleep_s(e, attempt))
                         self._note_switch(name, f"retry:{e.kind}")
             except ProviderError as e:
                 last = e

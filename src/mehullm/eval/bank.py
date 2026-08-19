@@ -125,7 +125,7 @@ def coverage(scenarios: list[Scenario]) -> dict[str, int]:
     return out
 
 
-# ------------------------------------------------------------------ seeding.
+# ------------------------------------------------------------------ seeding
 
 _SEED_SQL = """
 INSERT OR REPLACE INTO facts
@@ -143,7 +143,8 @@ def seed_db(base_db: str | Path, scratch: str | Path, scenario: Scenario) -> Pat
         try:
             scratch.unlink()
         except OSError:
-            # Windows refuses to delete an open file, and the per-scenario.
+            # Windows will not delete a file another process still holds open, so fall
+            # back to a numbered scratch name rather than failing the scenario.
             for n in range(1, 50):
                 alt = scratch.with_name(f"{scratch.stem}.{n}{scratch.suffix}")
                 if not alt.exists():
@@ -180,7 +181,7 @@ def seed_db(base_db: str | Path, scratch: str | Path, scenario: Scenario) -> Pat
                     f.get("observed_at", now),
                     "[]",
                     int(str(sup).lstrip("F")) if sup else None,
-                    # Seeded facts are 'active' by default: a scenario asserting.
+                    # 'active' unless the scenario deliberately seeds a retired fact.
                     f.get("status", "active"),
                     "seeded by eval scenario",
                     1,

@@ -81,7 +81,8 @@ def _cmd_run(a: argparse.Namespace) -> int:
             print(f"  [{e.scenario_id}] {e.problem}", file=sys.stderr)
         return 1
 
-    # The CALL must be inside the guard, not just the import -- a missing API key.
+    # The call, not just the import, belongs inside the guard: a missing API key
+    # only surfaces when the factory actually builds a client.
     try:
         from mehullm.eval.wiring import build_loop_factory
 
@@ -117,18 +118,22 @@ def _cmd_run(a: argparse.Namespace) -> int:
 
 
 def _cmd_style(a: argparse.Namespace) -> int:
-    from mehullm.eval.style_score import compare, normalised
+    from mehullm.eval.style_score import anchors, compare, normalised
 
     def lines(p: str) -> list[str]:
         return [ln for ln in Path(p).read_text(encoding="utf-8").splitlines() if ln.strip()]
 
     s = compare(lines(a.gen), lines(a.ref), perplexity_gain=a.ppl_gain)
+    floor, ceiling = (a.floor, a.ceiling)
+    if a.raw:
+        # Derive the anchors from data instead of trusting remembered constants.
+        floor, ceiling = anchors(lines(a.ref), lines(a.raw))
+
     print(s.report())
-    # Never report the raw total alone (§10). Against the human ceiling and the.
-    print(f"\n  floor {a.floor:.3f}   ceiling {a.ceiling:.3f}")
+    # The raw total is meaningless alone; always show it against floor and ceiling.
+    print(f"\n  floor {floor:.3f}   ceiling {ceiling:.3f}")
     print(
-        f"  NORMALISED {normalised(s.total, a.floor, a.ceiling):.3f}"
-        "   (0 = raw model, 1 = human-level)"
+        f"  NORMALISED {normalised(s.total, floor, ceiling):.3f}   (0 = raw model, 1 = human-level)"
     )
     return 0
 
@@ -193,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--ref", required=True)
     st.add_argument("--ceiling", type=float, default=0.914)
     st.add_argument("--floor", type=float, default=0.298)
+    st.add_argument("--raw", help="raw base-model messages; computes floor/ceiling from data")
     st.add_argument(
         "--ppl-gain",
         type=float,

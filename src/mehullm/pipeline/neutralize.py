@@ -11,10 +11,12 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 import regex
 
+from mehullm.persistence import db
 from mehullm.voice.client import OllamaClient, OllamaError
 
 __all__ = ["SYSTEM_PROMPT", "NeutralizeStats", "neutralize"]
@@ -26,8 +28,8 @@ SYSTEM_PROMPT = (
     "punctuation and emoji habits. Output only the message."
 )
 
-# PROMPTING NOTE -- this was rebuilt after a smoke test showed the first
-# attempt was worthless. Two failures, both fixed here:
+# Variant A translates Hinglish; variant B rephrases as a verbose assistant.
+# Few-shots matter more than the instruction: without them both drift into notes.
 
 _SYS_A = (
     "You translate Hinglish (Hindi written in Latin script) into formal English. "
@@ -125,8 +127,7 @@ class DraftCache:
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL")
+            conn = db.connect(self.path, rows=False)
             self._local.conn = conn
         return conn
 
@@ -215,6 +216,115 @@ def _stratified_sample(records: list[dict], limit: int, rng: random.Random) -> l
     return out[:limit]
 
 
+@dataclass
+class _Drafter:
+    """Generate the neutral input side for one record, sharing cache and stats."""
+
+    ollama: OllamaClient
+    cache: DraftCache
+    model: str
+    stats: NeutralizeStats
+    out: Any
+    started: float
+    on_progress: Any = None
+    progress_every: int = 200
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _write_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _draft(self, rec: dict, ctx: str, client: httpx.Client) -> str | None:
+        """A cached or freshly generated draft; None when the record is dropped."""
+        variant, target = rec["_variant"], rec["target"]
+        cache_input = target if variant == "A" else f"{ctx}\n---\n{target}"
+        key = DraftCache.key(self.model, variant, cache_input)
+
+        cached = self.cache.get(key)
+        if cached is not None:
+            with self._lock:
+                self.stats.cache_hits += 1
+            return cached
+
+        msgs = _messages_a(target) if variant == "A" else _messages_b(ctx, target)
+        try:
+            draft = self.ollama.chat(msgs, temperature=0.3, num_predict=120, client=client)
+        except OllamaError:
+            with self._lock:
+                self.stats.failed += 1
+            return None
+        if not _plausible(draft, target):
+            with self._lock:
+                self.stats.rejected += 1
+            return None
+
+        self.cache.put(key, variant, draft)
+        with self._lock:
+            self.stats.generated += 1
+        return draft
+
+    def handle(self, rec: dict, client: httpx.Client) -> None:
+        ctx = _render_context(rec["context"])
+        draft = self._draft(rec, ctx, client)
+        if draft is None:
+            return
+
+        variant = rec["_variant"]
+        row = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"<context>\n{ctx}\n</context>\n<draft>\n{draft.strip()}\n</draft>",
+                },
+                {"role": "assistant", "content": rec["target"]},
+            ],
+            "split": rec["split"],
+            "variant": variant,
+            "chat_id": rec["chat_id"],
+            "bucket": rec["bucket"],
+        }
+        with self._write_lock:
+            self.out.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self._lock:
+            self.stats.variants[variant] += 1
+            done = self.stats.variants["A"] + self.stats.variants["B"]
+            if self.on_progress and done % self.progress_every == 0:
+                self.on_progress(done, self.stats.selected, time.time() - self.started)
+
+    def run_chunk(self, chunk: list[dict]) -> None:
+        with httpx.Client(base_url=self.ollama.host, timeout=self.ollama.timeout) as client:
+            for rec in chunk:
+                self.handle(rec, client)
+
+
+def _load_by_split(pairs_path: Path, stats: NeutralizeStats) -> dict[str, list[dict]]:
+    by_split: dict[str, list[dict]] = defaultdict(list)
+    with pairs_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                rec = json.loads(line)
+                stats.considered += 1
+                by_split[rec["split"]].append(rec)
+    return by_split
+
+
+def _select(
+    by_split: dict[str, list[dict]],
+    train_limit: int,
+    val_limit: int,
+    rng: random.Random,
+    stats: NeutralizeStats,
+) -> list[dict]:
+    """heldout deliberately gets no drafts: it is scored against Mehul's real messages."""
+    selected: list[dict] = []
+    for split, limit in (("train", train_limit), ("val", val_limit)):
+        chosen = _stratified_sample(by_split.get(split, []), limit, rng)
+        for rec in chosen:
+            rec["_variant"] = "B" if rng.random() < VARIANT_B_SHARE else "A"
+        selected.extend(chosen)
+        stats.per_split[split] = len(chosen)
+    stats.selected = len(selected)
+    return selected
+
+
 def neutralize(
     pairs_path: str | Path,
     out_path: str | Path,
@@ -236,97 +346,30 @@ def neutralize(
     ollama = OllamaClient(model=model)
     ollama.preflight()
 
-    cache = DraftCache(cache_path)
+    selected = _select(_load_by_split(pairs_path, stats), train_limit, val_limit, rng, stats)
 
-    by_split: dict[str, list[dict]] = defaultdict(list)
-    with pairs_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.strip():
-                r = json.loads(line)
-                stats.considered += 1
-                by_split[r["split"]].append(r)
-
-    # heldout deliberately gets no drafts: it is scored against Mehul's REAL
-    # messages, so generating inputs for it would be wasted compute.
-    selected: list[dict] = []
-    for split, limit in (("train", train_limit), ("val", val_limit)):
-        chosen = _stratified_sample(by_split.get(split, []), limit, rng)
-        for r in chosen:
-            r["_variant"] = "B" if rng.random() < VARIANT_B_SHARE else "A"
-        selected.extend(chosen)
-        stats.per_split[split] = len(chosen)
-    stats.selected = len(selected)
-
-    lock = threading.Lock()
-    write_lock = threading.Lock()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fh_out = out_path.open("w", encoding="utf-8", newline="\n")
-
-    def work(rec: dict, client: httpx.Client) -> None:
-        variant = rec["_variant"]
-        target = rec["target"]
-        ctx = _render_context(rec["context"])
-        cache_input = target if variant == "A" else f"{ctx}\n---\n{target}"
-        key = DraftCache.key(model, variant, cache_input)
-
-        draft = cache.get(key)
-        if draft is not None:
-            with lock:
-                stats.cache_hits += 1
-        else:
-            msgs = _messages_a(target) if variant == "A" else _messages_b(ctx, target)
-            try:
-                draft = ollama.chat(msgs, temperature=0.3, num_predict=120, client=client)
-            except OllamaError:
-                with lock:
-                    stats.failed += 1
-                return
-            if not _plausible(draft, target):
-                with lock:
-                    stats.rejected += 1
-                return
-            cache.put(key, variant, draft)
-            with lock:
-                stats.generated += 1
-
-        row = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"<context>\n{ctx}\n</context>\n<draft>\n{draft.strip()}\n</draft>",
-                },
-                {"role": "assistant", "content": target},
-            ],
-            "split": rec["split"],
-            "variant": variant,
-            "chat_id": rec["chat_id"],
-            "bucket": rec["bucket"],
-        }
-        with write_lock:
-            fh_out.write(json.dumps(row, ensure_ascii=False) + "\n")
-        with lock:
-            stats.variants[variant] += 1
-            done = stats.variants["A"] + stats.variants["B"]
-            if on_progress and done % progress_every == 0:
-                on_progress(done, stats.selected, time.time() - started)
-
-    def runner(chunk: list[dict]) -> None:
-        with httpx.Client(base_url=ollama.host, timeout=ollama.timeout) as client:
-            for rec in chunk:
-                work(rec, client)
-
-    try:
+    with out_path.open("w", encoding="utf-8", newline="\n") as out:
+        drafter = _Drafter(
+            ollama=ollama,
+            cache=DraftCache(cache_path),
+            model=model,
+            stats=stats,
+            out=out,
+            started=started,
+            on_progress=on_progress,
+            progress_every=progress_every,
+        )
         chunks: list[list[dict]] = [[] for _ in range(max(1, concurrency))]
         for i, rec in enumerate(selected):
             chunks[i % len(chunks)].append(rec)
-        threads = [threading.Thread(target=runner, args=(c,), daemon=True) for c in chunks]
+        threads = [
+            threading.Thread(target=drafter.run_chunk, args=(c,), daemon=True) for c in chunks
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-    finally:
-        fh_out.close()
 
     stats.elapsed_s = time.time() - started
     return stats

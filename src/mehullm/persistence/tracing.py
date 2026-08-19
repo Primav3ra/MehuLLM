@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from mehullm.persistence import db
 from mehullm.pipeline.pii import scrub
 
 SpanKind = Literal[
@@ -68,9 +69,7 @@ class TraceStore:
     def _conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-            c.execute("PRAGMA journal_mode=WAL")
-            c.row_factory = sqlite3.Row
+            c = db.connect(self.path)
             self._local.c = c
         return c
 
@@ -204,7 +203,7 @@ class Span:
         return False
 
 
-# ------------------------------------------------------ ambient tracer.
+# ------------------------------------------------------ ambient tracer
 
 _store: TraceStore | None = None
 _trace: ContextVar[str | None] = ContextVar("trace_id", default=None)
@@ -265,26 +264,35 @@ def _payload(text: str | None) -> str | None:
     return scrub(text[:MAX_PAYLOAD])
 
 
+def _header(t: dict) -> list[str]:
+    dur = (t["ended_at"] or time.time()) - (t["started_at"] or 0)
+    return [
+        f"trace {t['trace_id']}  [{t['status']}]  {dur:.1f}s  {t['total_tokens']} tokens",
+        f"  in : {(t['user_input'] or '')[:100]}",
+        f"  out: {(t['final_output'] or '')[:100]}",
+        "",
+    ]
+
+
+def _span_lines(s: dict, widest: int) -> list[str]:
+    ms = s["duration_ms"] or 0
+    bar = "█" * max(1, int(24 * ms / max(1, widest)))
+    tok = f"{s['tokens_in']}→{s['tokens_out']}" if (s["tokens_in"] or s["tokens_out"]) else ""
+    mark = "!" if s["status"] == "error" else " "
+    lines = [f" {mark}{s['kind']:<14}{s['name'][:26]:<28}{ms:>6}ms {bar:<25}{tok}"]
+    if s["status"] == "error":
+        lines.append(f"    error: {(s['error'] or '')[:120]}")
+    return lines
+
+
 def render_tree(data: dict) -> str:
     """Human-readable span tree. `uv run mehullm-trace show <id>` uses this."""
     t, spans = data.get("trace"), data.get("spans", [])
     if not t:
         return "trace not found"
 
-    dur = (t["ended_at"] or time.time()) - (t["started_at"] or 0)
-    out = [
-        f"trace {t['trace_id']}  [{t['status']}]  {dur:.1f}s  {t['total_tokens']} tokens",
-        f"  in : {(t['user_input'] or '')[:100]}",
-        f"  out: {(t['final_output'] or '')[:100]}",
-        "",
-    ]
     widest = max((s["duration_ms"] or 0) for s in spans) if spans else 1
+    out = _header(t)
     for s in spans:
-        ms = s["duration_ms"] or 0
-        bar = "█" * max(1, int(24 * ms / max(1, widest)))
-        tok = f"{s['tokens_in']}→{s['tokens_out']}" if (s["tokens_in"] or s["tokens_out"]) else ""
-        mark = "!" if s["status"] == "error" else " "
-        out.append(f" {mark}{s['kind']:<14}{s['name'][:26]:<28}{ms:>6}ms {bar:<25}{tok}")
-        if s["status"] == "error":
-            out.append(f"    error: {(s['error'] or '')[:120]}")
+        out.extend(_span_lines(s, widest))
     return "\n".join(out)

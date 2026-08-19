@@ -177,7 +177,8 @@ def _assign_splits(
     remaining = [c for c in ranked if c not in heldout]
     val_target = sum(counts[c] for c in remaining) * VAL_SHARE
 
-    # Whole chats are indivisible, so an exact 15% is usually unreachable. A.
+    # Whole chats are indivisible, so an exact 15% split is usually unreachable;
+    # take the nearest achievable share instead.
     val, acc = set(), 0
     for c in sorted(remaining, key=lambda c: counts[c]):
         if abs(acc + counts[c] - val_target) < abs(acc - val_target):

@@ -35,7 +35,8 @@ _INVISIBLE = dict.fromkeys(
 # NBSP variants -> plain space. iOS uses U+202F (NARROW NO-BREAK SPACE) between.
 _NBSP = str.maketrans({" ": " ", " ": " ", " ": " ", " ": " "})
 
-# NOTE: we deliberately do NOT strip ZWJ (U+200D) or ZWNJ (U+200C) -- they are.
+# Deliberately keep ZWJ (U+200D) and ZWNJ (U+200C): they are meaningful in
+# Devanagari conjuncts and emoji sequences, so stripping them corrupts content.
 
 
 def normalize_line(line: str) -> str:
@@ -122,7 +123,8 @@ _EDITED_SUFFIX_RE = regex.compile(r"\s*<\s*This message was edited\s*>\s*$", reg
 
 _POLL_RE = regex.compile(r"^\s*POLL:\s", regex.IGNORECASE)
 
-# Call notices carry a SENDER ("Rohan: Missed voice call"), so they arrive via.
+# Call notices carry a SENDER ("Rohan: Missed voice call"), so they pass the
+# sender split and must be filtered on the body afterwards.
 _CALL_NOTICE_RE = regex.compile(
     r"^\s*(?:Missed\ (?:voice|video|group)\ call|Video\ call|Voice\ call|"
     r"(?:Call|Video)\ (?:ended|declined|unanswered)|No\ answer|Tap\ to\ call\ back)\s*$",
@@ -185,7 +187,8 @@ def _resolve_date_order(pairs: list[tuple[int, int, int]]) -> tuple[str, str]:
     if any(f1 > 31 for f1, _, _ in pairs):
         return "year_first", "field 1 exceeds 31 -> ISO-style year-first"
 
-    # Count evidence rather than trusting the FIRST hit. A single malformed.
+    # Count evidence rather than trusting the FIRST hit: one malformed date would
+    # otherwise pick the format for the entire file.
     n1 = sum(1 for f1, _, _ in pairs if f1 > 12)
     n2 = sum(1 for _, f2, _ in pairs if f2 > 12)
 

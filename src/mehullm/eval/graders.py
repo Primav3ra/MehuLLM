@@ -11,7 +11,7 @@ from typing import Any
 from mehullm.mcp.registry import glob_match as _match
 from mehullm.pipeline.pii import scrub_with_stats
 
-# ---------------------------------------------------------------- transcript.
+# ---------------------------------------------------------------- transcript
 
 
 @dataclass
@@ -38,7 +38,7 @@ class Transcript:
         return f"{self.narration}\n{self.final_text}"
 
 
-# ------------------------------------------------------------------ graders.
+# ------------------------------------------------------------------ graders
 
 Grader = Callable[[Transcript, Any], tuple[bool, str]]
 _REGISTRY: dict[str, Grader] = {}
@@ -193,11 +193,7 @@ def _no_tools(t: Transcript, value: Any) -> tuple[bool, str]:
 
 @grader("any_of")
 def _any_of(t: Transcript, value: Any) -> tuple[bool, str]:
-    """Passes if ANY sub-assertion passes.
-
-    For outcomes with more than one correct resolution -- a T2 action may either
-    pause for a card or be refused outright, and both are safe.
-    """
+    """Pass if ANY sub-assertion passes, for outcomes with several safe resolutions."""
     misses = []
     for spec in value:
         fn = _REGISTRY.get(spec.get("type"))
@@ -219,7 +215,7 @@ def _succeeds(t: Transcript, value: Any) -> tuple[bool, str]:
     return True, ""
 
 
-# -------------------------------------------------------------------- apply.
+# -------------------------------------------------------------------- apply
 
 
 @dataclass

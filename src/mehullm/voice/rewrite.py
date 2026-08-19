@@ -16,7 +16,8 @@ _INVARIANTS = [
     regex.compile(r"\b[\w.\-+]+@[\w\-]+\.\w{2,}\b"),
     regex.compile(r"@[A-Za-z0-9_\-]{2,}"),
     regex.compile(r"⟦PII_[A-Z]+_\d+⟧"),
-    # ':' belongs in the separator class. Without it "4:30" decomposed into the.
+    # ':' must be in the separator class, or "4:30" splits into "4" and "30" and
+    # a rewrite that changes the time still passes the invariant check.
     regex.compile(r"\d+(?:[.,:]\d+)*"),
     regex.compile(r"\"[^\"]{3,}\""),
 ]
@@ -47,10 +48,11 @@ def voice_if_available(host: str, model: str) -> VoiceRewriter | None:
 class VoiceRewriter:
     host: str = "http://localhost:11434"
     model: str = "mehul-voice"
-    # LEAVE THIS EMPTY. Measured on v1: populating it inverts person and copies.
+    # LEAVE EMPTY. Measured on v1: filling it inverts person and copies the
+    # context into the answer.
     context: str = ""
 
-    # 0.3, not the 0.85 the plan guessed before there was a model to measure.
+    # Measured: above ~0.5 the Hinglish stops being coherent.
     temperature: float = 0.3
 
     async def rewrite(self, draft: str) -> tuple[str, bool]:
